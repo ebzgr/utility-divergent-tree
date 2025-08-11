@@ -1,0 +1,14 @@
+Metadata-Version: 2.4
+Name: divtree
+Version: 0.1.0
+Summary: Recursive partitioning to audit divergence between firm-side and consumer-side treatment effects.
+Author-email: Your Name <you@example.com>
+License: MIT
+Project-URL: Homepage, https://github.com/yourname/divergence-tree
+Requires-Python: >=3.9
+Description-Content-Type: text/markdown
+Requires-Dist: numpy>=1.23
+
+# DivergenceTree
+
+A recursive partitioning algorithm to detect divergence between firm-side and consumer-side treatment effects.
