@@ -48,18 +48,18 @@ if __name__ == "__main__":
     from divtree.tune import tune_with_optuna_partial
 
     # --- simulate data (or your real data) ---
-    X, T, YF, YC = make_data(n=100_000, seed=0, aF=0.20, aC=0.30)
+    X, T, YF, YC = make_data(n=200000, seed=0, aF=0.20, aC=0.30)
 
     # --- freeze what you want fixed ---
     fixed = {
         "honest": True,
-        "lambda_": 5,
+        "lambda_": 1,
         "n_quantiles": 50,
-        "min_leaf_treated": 120,
-        "min_leaf_control": 120,
-        "min_leaf_conv_treated": 25,
-        "min_leaf_conv_control": 25,
-        "random_state": 123,  # for reproducibility
+        "min_leaf_treated": 1,
+        "min_leaf_control": 1,
+        "min_leaf_conv_treated": 1,
+        "min_leaf_conv_control": 1,
+        "random_state": 0,  # for reproducibility
     }
 
     # --- tune only these two ---
@@ -76,7 +76,7 @@ if __name__ == "__main__":
         fixed=fixed,
         search_space=search_space,
         valid_fraction=0.2,
-        n_trials=30,
+        n_trials=10,
         random_state=123,
     )
     print("Best params:", best_params)

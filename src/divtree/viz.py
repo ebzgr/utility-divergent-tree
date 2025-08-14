@@ -196,14 +196,10 @@ def plot_divergence_tree(
         ax.add_patch(rect)
 
         if is_leaf:
-            txt = (
-                f"Leaf d={n.depth}\n"
-                f"τF={_r(n.tauF)}, τC={_r(n.tauC)}\n"
-                f"n={n.n}, n1={n.n_treated}, n0={n.n_control}"
-            )
+            txt = f"Leaf d={n.depth}\n" f"τF={_r(n.tauF)}, τC={_r(n.tauC)}"
         else:
             thr = round(n.threshold, round_digits) if n.threshold is not None else "?"
-            txt = f"X[{n.feature}] ≤ {thr}"
+            txt = f"X[{n.feature}] ≤ {thr}\n" f"τF={_r(n.tauF)}, τC={_r(n.tauC)}"
 
         ax.text(
             x,

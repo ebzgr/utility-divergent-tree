@@ -2,6 +2,8 @@ import numpy as np
 from dataclasses import dataclass
 from typing import Optional, Tuple, Dict, Any
 from dataclasses import dataclass
+from concurrent.futures import as_completed
+import multiprocessing as mp
 
 
 # before:
@@ -26,27 +28,36 @@ class TreeNode:
 
 class DivergenceTree:
     """
-    Recursive partitioning to audit joint heterogeneity in firm-side and consumer-side treatment effects.
+    Recursive partitioning to audit joint heterogeneity in firm-side and consumer-side
+    treatment effects.
 
-    Flow at each node:
-      1) Propose a split (feature, threshold) using split-subsample indices
-      2) Route ESTIMATION indices down left/right child
-      3) Compute tauF, tauC in children (on estimation indices only)
-      4) Compute joint gain and pick best split if gain > 0
+    Split gain uses a *scaled* joint heterogeneity term plus a co-movement bonus:
+       H = ((tauF - parentF)/sF)^2 + ((tauC - parentC)/sC)^2
+       d = ((tauF - parentF)/sF) * ((tauC - parentC)/sC)
+       phi(d) = |d|      if co_movement == "both"
+                max(0,d) if co_movement == "converge"
+                max(0,-d) if co_movement == "diverge"
+       g = H + lambda_ * phi(d)
+
+    Scales (sF, sC) are the parent-level standard errors of the diff-in-means
+    estimators, so each outcome contributes comparably.
     """
 
     def __init__(
         self,
-        lambda_: float = 0.5,
+        lambda_: float = 1.0,
         max_depth: int = 4,
         min_leaf_n: int = 100,
-        min_leaf_treated: int = 40,
-        min_leaf_control: int = 40,
-        min_leaf_conv_treated: int = 10,
-        min_leaf_conv_control: int = 10,
+        min_leaf_treated: int = 1,
+        min_leaf_control: int = 1,
+        min_leaf_conv_treated: int = 1,
+        min_leaf_conv_control: int = 1,
         honest: bool = True,
         n_quantiles: int = 32,
         random_state: Optional[int] = None,
+        n_workers: int = -1,
+        co_movement: str = "both",  # NEW: {"both","diverge","converge"}
+        eps_scale: float = 1e-8,  # NEW: numerical floor for scales
     ):
         self.lambda_ = float(lambda_)
         self.max_depth = int(max_depth)
@@ -58,6 +69,16 @@ class DivergenceTree:
         self.honest = bool(honest)
         self.n_quantiles = int(n_quantiles)
         self.random_state = random_state
+        self.n_workers = int(n_workers)
+
+        # --- NEW: co-movement mode + scaling epsilon
+        co_movement = (co_movement or "both").lower()
+        if co_movement not in {"both", "diverge", "converge"}:
+            raise ValueError(
+                "co_movement must be one of {'both','diverge','converge'}."
+            )
+        self.co_movement = co_movement
+        self.eps_scale = float(eps_scale)
 
         self.root_: Optional[TreeNode] = None
         self._fit_data: Dict[str, Any] = {}
@@ -65,6 +86,12 @@ class DivergenceTree:
     # ---------------- Public API ----------------
 
     def fit(self, X, T, YF, YC):
+        """
+        X: features (n,p)
+        T: treatment in {0,1}
+        YF: firm outcome in {0,1}; YC must be np.nan when YF==0
+        YC: consumer outcome (float) for converters only (YF==1)
+        """
         X = np.asarray(X)
         T = np.asarray(T)
         YF = np.asarray(YF)
@@ -191,9 +218,6 @@ class DivergenceTree:
         if node.depth >= self.max_depth:
             return
 
-        best_gain = -np.inf
-        best = None
-
         X = self._fit_data["X"]
         idx_split = node.idx_split
         idx_est_all = self._fit_data["idx_est"]
@@ -204,9 +228,16 @@ class DivergenceTree:
         if not (np.isfinite(parent_tauF) and np.isfinite(parent_tauC)):
             return
 
+        # --- NEW: compute parent-level scales for normalization ---
+        sF, sC = self._compute_scales(est_idx_parent)
+        # Guard-rail: if scales are degenerate, stop splitting
+        if not (np.isfinite(sF) and np.isfinite(sC)) or (sF <= 0 or sC <= 0):
+            return
+
         p = X.shape[1]
 
-        # loop features
+        # Prepare tasks for parallel processing
+        tasks = []
         for f in range(p):
             x_split = X[idx_split, f]
             if np.unique(x_split).size <= 1:
@@ -219,59 +250,46 @@ class DivergenceTree:
                 continue
 
             for thr in thresholds:
-                left_mask_split = x_split <= thr
-                right_mask_split = ~left_mask_split
-                if (
-                    left_mask_split.sum() < self.min_leaf_n
-                    or right_mask_split.sum() < self.min_leaf_n
-                ):
-                    continue
+                tasks.append((f, thr, x_split))
 
-                # route estimation indices with the candidate extra rule
-                left_mask_est = self._route_mask(
-                    idx_est_all, upto=node, extra_rule=(f, float(thr), True)
-                )
-                right_mask_est = self._route_mask(
-                    idx_est_all, upto=node, extra_rule=(f, float(thr), False)
-                )
-                idx_est_L = idx_est_all[left_mask_est]
-                idx_est_R = idx_est_all[right_mask_est]
+        # Process tasks in parallel
+        best_gain = -np.inf
+        best = None
 
-                # feasibility checks on estimation set
-                if not (self._feasible(idx_est_L) and self._feasible(idx_est_R)):
-                    continue
+        if tasks:
+            from concurrent.futures import ThreadPoolExecutor
 
-                tauF_L, tauC_L, nL, _, _ = self._estimate_effects(idx_est_L)
-                tauF_R, tauC_R, nR, _, _ = self._estimate_effects(idx_est_R)
-                if not (
-                    np.isfinite(tauF_L)
-                    and np.isfinite(tauC_L)
-                    and np.isfinite(tauF_R)
-                    and np.isfinite(tauC_R)
-                ):
-                    continue
-
-                wL = nL / (nL + nR)
-                wR = 1.0 - wL
-                g_parent = self._g(parent_tauF, parent_tauC, parent_tauF, parent_tauC)
-                g_left = self._g(tauF_L, tauC_L, parent_tauF, parent_tauC)
-                g_right = self._g(tauF_R, tauC_R, parent_tauF, parent_tauC)
-                gain = wL * g_left + wR * g_right - g_parent
-
-                if gain > best_gain:
-                    best_gain = gain
-                    best = dict(
-                        feature=f,
-                        threshold=float(thr),
-                        left_mask_split=left_mask_split,
-                        right_mask_split=right_mask_split,
-                        idx_est_L=idx_est_L,
-                        idx_est_R=idx_est_R,
-                        tauF_L=tauF_L,
-                        tauC_L=tauC_L,
-                        tauF_R=tauF_R,
-                        tauC_R=tauC_R,
+            n_workers = (
+                mp.cpu_count()
+                if self.n_workers == -1
+                else min(self.n_workers, len(tasks))
+            )
+            with ThreadPoolExecutor(max_workers=n_workers) as executor:
+                futures = []
+                for f, thr, x_split in tasks:
+                    future = executor.submit(
+                        self._evaluate_split_candidate,
+                        f,
+                        thr,
+                        x_split,
+                        idx_split,
+                        idx_est_all,
+                        node,
+                        parent_tauF,
+                        parent_tauC,
+                        sF,  # NEW: pass scales
+                        sC,
                     )
+                    futures.append(future)
+
+                for future in as_completed(futures):
+                    try:
+                        result = future.result()
+                        if result is not None and result["gain"] > best_gain:
+                            best_gain = result["gain"]
+                            best = result
+                    except Exception:
+                        continue
 
         if best is None or best_gain <= 0:
             return
@@ -313,9 +331,97 @@ class DivergenceTree:
 
     # --------------- helpers ----------------
 
+    def _evaluate_split_candidate(
+        self,
+        feature: int,
+        threshold: float,
+        x_split: np.ndarray,
+        idx_split: np.ndarray,
+        idx_est_all: np.ndarray,
+        node: TreeNode,
+        parent_tauF: float,
+        parent_tauC: float,
+        sF: float,  # NEW
+        sC: float,  # NEW
+    ) -> Optional[Dict]:
+        """Evaluate a single split candidate and return the result if valid."""
+        left_mask_split = x_split <= threshold
+        right_mask_split = ~left_mask_split
+
+        if (
+            left_mask_split.sum() < self.min_leaf_n
+            or right_mask_split.sum() < self.min_leaf_n
+        ):
+            return None
+
+        # route estimation indices with the candidate extra rule
+        left_mask_est = self._route_mask(
+            idx_est_all, upto=node, extra_rule=(feature, float(threshold), True)
+        )
+        right_mask_est = self._route_mask(
+            idx_est_all, upto=node, extra_rule=(feature, float(threshold), False)
+        )
+        idx_est_L = idx_est_all[left_mask_est]
+        idx_est_R = idx_est_all[right_mask_est]
+
+        # feasibility checks on estimation set
+        if not (self._feasible(idx_est_L) and self._feasible(idx_est_R)):
+            return None
+
+        tauF_L, tauC_L, nL, _, _ = self._estimate_effects(idx_est_L)
+        tauF_R, tauC_R, nR, _, _ = self._estimate_effects(idx_est_R)
+        if not (
+            np.isfinite(tauF_L)
+            and np.isfinite(tauC_L)
+            and np.isfinite(tauF_R)
+            and np.isfinite(tauC_R)
+        ):
+            return None
+
+        wL = nL / (nL + nR)
+        wR = 1.0 - wL
+
+        # parent g is zero by construction (centered), but keep call for clarity
+        g_parent = self._g(parent_tauF, parent_tauC, parent_tauF, parent_tauC, sF, sC)
+        g_left = self._g(tauF_L, tauC_L, parent_tauF, parent_tauC, sF, sC)
+        g_right = self._g(tauF_R, tauC_R, parent_tauF, parent_tauC, sF, sC)
+        gain = wL * g_left + wR * g_right - g_parent
+
+        if gain <= 0:
+            return None
+
+        return dict(
+            feature=feature,
+            threshold=float(threshold),
+            left_mask_split=left_mask_split,
+            right_mask_split=right_mask_split,
+            idx_est_L=idx_est_L,
+            idx_est_R=idx_est_R,
+            tauF_L=tauF_L,
+            tauC_L=tauC_L,
+            tauF_R=tauF_R,
+            tauC_R=tauC_R,
+            gain=gain,
+        )
+
     def _g(
-        self, tauF: float, tauC: float, parent_tauF: float, parent_tauC: float
+        self,
+        tauF: float,
+        tauC: float,
+        parent_tauF: float,
+        parent_tauC: float,
+        sF: float,
+        sC: float,
     ) -> float:
+        """
+        Node scoring function.
+
+        Effects are centered and standardized by their parent-node standard errors
+        (sF, sC) before computing the heterogeneity and co-movement terms.
+        This parent-level scaling ensures both outcomes contribute comparably to
+        the split decision regardless of their raw scales, so a single global λ
+        remains meaningful throughout the tree.
+        """
         if not (
             np.isfinite(tauF)
             and np.isfinite(tauC)
@@ -323,11 +429,88 @@ class DivergenceTree:
             and np.isfinite(parent_tauC)
         ):
             return -np.inf
-        return (
-            (tauF - parent_tauF) ** 2
-            + (tauC - parent_tauC) ** 2
-            + self.lambda_ * abs(tauF * tauC)
-        )
+
+        # centered & scaled deviations
+        zF = (tauF - parent_tauF) / max(sF, self.eps_scale)
+        zC = (tauC - parent_tauC) / max(sC, self.eps_scale)
+
+        H = zF**2 + zC**2
+        d = zF * zC  # centered cross-moment (covariance-like)
+
+        if self.co_movement == "both":
+            phi = abs(d)
+        elif self.co_movement == "converge":
+            phi = max(0.0, d)
+        else:  # "diverge"
+            phi = max(0.0, -d)
+
+        return H + self.lambda_ * phi
+
+    def _compute_scales(self, idx: np.ndarray) -> Tuple[float, float]:
+        """
+        Parent-level scales (standard errors) for diff-in-means:
+          sF = sqrt( Var(YF|T=1)/n1 + Var(YF|T=0)/n0 )
+          sC = sqrt( Var(YC|T=1,YF=1)/c1 + Var(YC|T=0,YF=1)/c0 )
+        These make H and d approximately scale-free across outcomes.
+        """
+        T = self._fit_data["T"]
+        YF = self._fit_data["YF"]
+        YC = self._fit_data["YC"]
+
+        sub_T = T[idx]
+        sub_YF = YF[idx]
+        sub_YC = YC[idx]
+
+        treated = sub_T == 1
+        control = ~treated
+
+        n1 = treated.sum()
+        n0 = control.sum()
+
+        # Firm-side: Bernoulli variance p*(1-p)
+        # Guard against empty arms
+        if n1 > 0:
+            p1 = float(sub_YF[treated].mean())
+            var1 = p1 * (1 - p1)
+        else:
+            var1 = np.nan
+        if n0 > 0:
+            p0 = float(sub_YF[control].mean())
+            var0 = p0 * (1 - p0)
+        else:
+            var0 = np.nan
+
+        sF2 = 0.0
+        if n1 > 0 and n0 > 0:
+            sF2 = var1 / max(n1, 1) + var0 / max(n0, 1)
+        sF = float(np.sqrt(max(sF2, self.eps_scale)))
+
+        # Consumer-side: among converters in each arm
+        conv_treat = treated & (sub_YF == 1)
+        conv_ctrl = control & (sub_YF == 1)
+        c1 = conv_treat.sum()
+        c0 = conv_ctrl.sum()
+
+        if c1 > 1:
+            varC1 = float(np.var(sub_YC[conv_treat], ddof=1))
+        elif c1 == 1:
+            varC1 = 0.0
+        else:
+            varC1 = np.nan
+
+        if c0 > 1:
+            varC0 = float(np.var(sub_YC[conv_ctrl], ddof=1))
+        elif c0 == 1:
+            varC0 = 0.0
+        else:
+            varC0 = np.nan
+
+        sC2 = 0.0
+        if c1 > 0 and c0 > 0:
+            sC2 = (varC1 / max(c1, 1)) + (varC0 / max(c0, 1))
+        sC = float(np.sqrt(max(sC2, self.eps_scale)))
+
+        return sF, sC
 
     def _estimate_effects(self, idx: np.ndarray) -> Tuple[float, float, int, int, int]:
         T = self._fit_data["T"]
