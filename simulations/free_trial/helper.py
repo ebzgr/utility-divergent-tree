@@ -86,22 +86,35 @@ def _plot_outcomes_vs_latent_on_ax(
     Y_user: np.ndarray,
     nbins: int = 20,
 ) -> None:
+    """
+    Plot firm and user outcomes vs latent variable, separated by treatment.
+
+    Args:
+        ax: Matplotlib axis
+        latent: Latent variable values
+        latent_label: Label for the latent variable
+        T: Treatment assignment (0=Short, 1=Long)
+        Y_firm: Firm outcome (subscription)
+        Y_user: User outcome (satisfaction)
+        nbins: Number of bins for averaging
+    """
     T = np.asarray(T).astype(int)
     mask0, mask1 = (T == 0), (T == 1)
 
-    # Firm outcome
+    # Firm outcome (subscription rate)
     x0, yf0 = _quantile_binned_xy(latent[mask0], Y_firm[mask0], nbins)
     x1, yf1 = _quantile_binned_xy(latent[mask1], Y_firm[mask1], nbins)
-    # User outcome (YC may be NaN for non-subscribers; mean ignores NaN)
+
+    # User outcome (satisfaction - only for subscribers)
     x0u, yu0 = _quantile_binned_xy(latent[mask0], Y_user[mask0], nbins)
     x1u, yu1 = _quantile_binned_xy(latent[mask1], Y_user[mask1], nbins)
 
-    ax.plot(x0, yf0, marker="o", linewidth=1, label="Firm outcome (Short)")
-    ax.plot(x1, yf1, marker="o", linewidth=1, label="Firm outcome (Long)")
-    ax.plot(x0u, yu0, marker="s", linewidth=1, label="User outcome (Short)")
-    ax.plot(x1u, yu1, marker="s", linewidth=1, label="User outcome (Long)")
+    ax.plot(x0, yf0, marker="o", linewidth=1, label="Subscription rate (Short)")
+    ax.plot(x1, yf1, marker="o", linewidth=1, label="Subscription rate (Long)")
+    ax.plot(x0u, yu0, marker="s", linewidth=1, label="Satisfaction (Short)")
+    ax.plot(x1u, yu1, marker="s", linewidth=1, label="Satisfaction (Long)")
 
-    ax.set_title(f"Average outcomes vs {latent_label}")
+    ax.set_title(f"Outcomes vs {latent_label}")
     ax.set_xlabel(latent_label)
     ax.set_ylabel("Average outcome")
     ax.grid(True)
@@ -143,14 +156,15 @@ def plot_six_panels_outcomes_and_pi(
     show: bool = True,
 ) -> Tuple[plt.Figure, np.ndarray]:
     """
-    Create one figure with 6 subplots:
-      Row 1:  outcomes vs Usefulness, Novelty, Sunk Cost (4 lines each: firm/user x short/long)
-      Row 2:  pi vs Usefulness, Novelty, Sunk Cost (2 lines each: short/long)
+    Create one figure with 6 subplots showing relationships between latent variables and outcomes:
+      Row 1: Subscription probability vs Usefulness, Novelty, Sunk Cost
+      Row 2: Firm outcomes (subscription rate) vs Usefulness, Novelty, Sunk Cost
+      Row 3: User outcomes (satisfaction) vs Usefulness, Novelty, Sunk Cost
 
     Args:
         T: array-like, 0=Short, 1=Long
         Y_firm: array-like, firm outcome (subscription, 0/1)
-        Y_user: array-like, user outcome (e.g., YC; NaN for non-subscribers ok)
+        Y_user: array-like, user outcome (satisfaction; NaN for non-subscribers ok)
         pi: array-like, subscription probability
         L: dict with keys "U", "N", "S" (latent arrays in [0,1])
         nbins: number of quantile bins
@@ -158,28 +172,23 @@ def plot_six_panels_outcomes_and_pi(
         show: whether to call plt.show()
 
     Returns:
-        (fig, axes) where axes is a 2x3 ndarray of Axes.
+        (fig, axes) where axes is a 3x3 ndarray of Axes.
     """
     U = np.asarray(L["U"])
     N = np.asarray(L["N"])
     S = np.asarray(L["S"])
 
-    fig, axes = plt.subplots(3, 3, figsize=figsize)
+    fig, axes = plt.subplots(2, 3, figsize=figsize)
 
-    # Row 1: outcomes vs latent
-    _plot_pi_vs_latent_on_ax(axes[0, 0], U, "Usefulness", T, U, nbins)
-    _plot_pi_vs_latent_on_ax(axes[0, 1], N, "Novelty", T, U, nbins)
-    _plot_pi_vs_latent_on_ax(axes[0, 2], S, "Sunk Cost", T, U, nbins)
+    # Row 1: Subscription probability vs latent variables
+    _plot_pi_vs_latent_on_ax(axes[0, 0], U, "Usefulness", T, pi, nbins)
+    _plot_pi_vs_latent_on_ax(axes[0, 1], N, "Novelty", T, pi, nbins)
+    _plot_pi_vs_latent_on_ax(axes[0, 2], S, "Sunk Cost", T, pi, nbins)
 
-    # Row 2: pi vs latent
-    _plot_pi_vs_latent_on_ax(axes[1, 0], U, "Usefulness", T, pi, nbins)
-    _plot_pi_vs_latent_on_ax(axes[1, 1], N, "Novelty", T, pi, nbins)
-    _plot_pi_vs_latent_on_ax(axes[1, 2], S, "Sunk Cost", T, pi, nbins)
-
-    # Row 1: outcomes vs latent
-    _plot_pi_vs_latent_on_ax(axes[2, 0], U, "Usefulness", T, Y_user, nbins)
-    _plot_pi_vs_latent_on_ax(axes[2, 1], N, "Novelty", T, Y_user, nbins)
-    _plot_pi_vs_latent_on_ax(axes[2, 2], S, "Sunk Cost", T, Y_user, nbins)
+    # Row 2: Firm outcomes (subscription rate) vs latent variables
+    _plot_pi_vs_latent_on_ax(axes[1, 0], U, "Usefulness", T, Y_user, nbins)
+    _plot_pi_vs_latent_on_ax(axes[1, 1], N, "Novelty", T, Y_user, nbins)
+    _plot_pi_vs_latent_on_ax(axes[1, 2], S, "Sunk Cost", T, Y_user, nbins)
 
     plt.tight_layout()
     if show:
@@ -263,29 +272,29 @@ def plot_latent_overview(
     # Top row: binned latent vs gate feature
     _binned_line(
         axes[0, 0],
-        X[:, gate_indices["U"]],
+        X[:, gate_indices["U"][0]],  # Use first (and only) index
         U,
         nbins,
         title="Usefulness vs gated X",
-        xlabel="X[:, {}] (binned)".format(gate_indices["U"]),
+        xlabel="X[:, {}] (binned)".format(gate_indices["U"][0]),
         ylabel="avg U",
     )
     _binned_line(
         axes[0, 1],
-        X[:, gate_indices["N"]],
+        X[:, gate_indices["N"][0]],  # Use first (and only) index
         N,
         nbins,
         title="Novelty vs gated X",
-        xlabel="X[:, {}] (binned)".format(gate_indices["N"]),
+        xlabel="X[:, {}] (binned)".format(gate_indices["N"][0]),
         ylabel="avg N",
     )
     _binned_line(
         axes[0, 2],
-        X[:, gate_indices["S"]],
+        X[:, gate_indices["S"][0]],  # Use first (and only) index
         S,
         nbins,
         title="Sunk Cost vs gated X",
-        xlabel="X[:, {}] (binned)".format(gate_indices["S"]),
+        xlabel="X[:, {}] (binned)".format(gate_indices["S"][0]),
         ylabel="avg S",
     )
 

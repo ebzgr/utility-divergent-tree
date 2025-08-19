@@ -7,7 +7,7 @@ from divtree.viz import plot_divergence_tree
 import pdb
 
 
-def make_data(n=4000, seed=42, aF=0.1, aC=0.1):
+def make_data(n=4000, seed=0, aF=0.1, aC=0.1):
     rng = np.random.default_rng(seed)
     X = rng.normal(size=(n, 10))  # we only really use X[:,0] and X[:,1]
     T = rng.integers(0, 2, size=n)

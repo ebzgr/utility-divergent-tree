@@ -15,7 +15,7 @@ def plot_divergence_tree(
     v_spacing=2.0,  # vertical spacing between depths
     node_width=2.4,  # node box width
     node_height=1.0,  # node box height
-    font_size=9,
+    font_size=13,
     edge_color="#808080",
     internal_fc="#FFFFFF",
     internal_ec="#333333",
@@ -26,7 +26,7 @@ def plot_divergence_tree(
     align_pospos="#5CB85C",  # both positive
     align_negneg="#A0A0A0",  # both negative
     neutral="#DDDDDD",  # near zero / undefined
-    edge_label_fontsize=8,
+    edge_label_fontsize=11,
     show_legend=True,
     ax=None,
 ):
@@ -196,10 +196,14 @@ def plot_divergence_tree(
         ax.add_patch(rect)
 
         if is_leaf:
-            txt = f"Leaf d={n.depth}\n" f"τF={_r(n.tauF)}, τC={_r(n.tauC)}"
+            txt = f"$\\tau_{{F}}={_r(n.tauF)}$\n$\\tau_{{C}}={_r(n.tauC)}$"
         else:
             thr = round(n.threshold, round_digits) if n.threshold is not None else "?"
-            txt = f"X[{n.feature}] ≤ {thr}\n" f"τF={_r(n.tauF)}, τC={_r(n.tauC)}"
+            txt = (
+                f"X[{n.feature}] ≤ {thr}\n"
+                f"$\\tau_{{F}}={_r(n.tauF)}$\n"
+                f"$\\tau_{{C}}={_r(n.tauC)}$"
+            )
 
         ax.text(
             x,
@@ -224,7 +228,7 @@ def plot_divergence_tree(
                 [0],
                 marker="s",
                 color="w",
-                label="τF>0, τC>0",
+                label="$\\tau_F>0, \\tau_C>0$",
                 markerfacecolor=align_pospos,
                 markersize=12,
             ),
@@ -233,7 +237,7 @@ def plot_divergence_tree(
                 [0],
                 marker="s",
                 color="w",
-                label="τF<0, τC<0",
+                label="$\\tau_F<0, \\tau_C<0$",
                 markerfacecolor=align_negneg,
                 markersize=12,
             ),
@@ -242,7 +246,7 @@ def plot_divergence_tree(
                 [0],
                 marker="s",
                 color="w",
-                label="τF>0, τC<0",
+                label="$\\tau_F>0, \\tau_C<0$",
                 markerfacecolor=diverge_posneg,
                 markersize=12,
             ),
@@ -251,21 +255,12 @@ def plot_divergence_tree(
                 [0],
                 marker="s",
                 color="w",
-                label="τF<0, τC>0",
+                label="$\\tau_F<0, \\tau_C>0$",
                 markerfacecolor=diverge_negpos,
                 markersize=12,
             ),
-            Line2D(
-                [0],
-                [0],
-                marker="s",
-                color="w",
-                label="near 0 / nan",
-                markerfacecolor=neutral,
-                markersize=12,
-            ),
         ]
-        ax.legend(handles=legend_elems, loc="upper left", frameon=False, fontsize=9)
+        ax.legend(handles=legend_elems, loc="upper left", frameon=False, fontsize=11)
 
     fig.tight_layout()
     return fig, ax

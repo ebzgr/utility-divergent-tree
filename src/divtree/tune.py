@@ -6,15 +6,17 @@ Assumptions:
 - Firm outcome YF is Bernoulli; consumer outcome YC is numeric and only defined when YF==1.
 - Validation loss is standardized by validation SEs so firm/consumer contribute fairly.
 - Adds a stump penalty (discourages trivial trees).
-- Adds a lexicographic tie-break toward stronger convergence/divergence on validation.
 
 Public API:
 - tune_with_optuna_partial(...)
 """
 
 import numpy as np
-from typing import Dict, Any, Optional, Tuple
+from typing import Dict, Any, Optional
 from .tree import DivergenceTree
+
+
+# --------------------------- Basic effects (unchanged) ---------------------------
 
 
 def _estimate_effects_simple(T, YF, YC, idx):
@@ -152,70 +154,7 @@ def evaluate_tree_consistency(
     return float(loss)
 
 
-# --------------------------- Validation co-movement bonus ---------------------------
-
-
-def _phi(d: float, mode: str) -> float:
-    """Same φ as training objective (mode: 'both' | 'converge' | 'diverge')."""
-    mode = (mode or "both").lower()
-    if mode == "converge":
-        return max(0.0, d)
-    if mode == "diverge":
-        return max(0.0, -d)
-    return abs(d)  # "both"
-
-
-def validation_comovement_bonus(
-    tree: DivergenceTree,
-    X_val: np.ndarray,
-    T_val: np.ndarray,
-    YF_val: np.ndarray,
-    YC_val: np.ndarray,
-) -> float:
-    """
-    Measures targeted co-movement on validation (higher is better), standardized by
-    validation SEs and weighted by validation leaf sizes.
-    """
-    leaves_val = tree.predict_leaf(X_val)
-    uniq_leaves = list({id(l): l for l in leaves_val}.values())
-    n_val_total = X_val.shape[0]
-    mode = getattr(tree, "co_movement", "both")
-
-    bonus = 0.0
-    for leaf in uniq_leaves:
-        m_val = np.array([l is leaf for l in leaves_val])
-        idx_val = np.where(m_val)[0]
-        if idx_val.size == 0:
-            continue
-
-        # validation effects & SEs
-        tF_val, tC_val, _ = _estimate_effects_simple(T_val, YF_val, YC_val, idx_val)
-        seF = _leaf_se_F_bernoulli(T_val, YF_val, idx_val)
-        seC = _leaf_se_C_generic(T_val, YF_val, YC_val, idx_val)
-
-        ok = (
-            np.isfinite(tF_val)
-            and np.isfinite(tC_val)
-            and np.isfinite(seF)
-            and np.isfinite(seC)
-            and seF > 0
-            and seC > 0
-        )
-        if not ok:
-            continue
-
-        # center on the leaf's learned effects (training promise)
-        zF = (float(tF_val) - float(leaf.tauF)) / max(seF, 1e-8)
-        zC = (float(tC_val) - float(leaf.tauC)) / max(seC, 1e-8)
-        d = zF * zC
-
-        w = idx_val.size / max(1, n_val_total)
-        bonus += w * _phi(d, mode)
-
-    return float(bonus)
-
-
-# --------------------------- Optuna tuning (with penalties & tie-break) ---------------------------
+# --------------------------- Optuna tuning (stump penalty only) ---------------------------
 
 
 def tune_with_optuna_partial(
@@ -228,8 +167,6 @@ def tune_with_optuna_partial(
     valid_fraction: float = 0.25,
     n_trials: int = 50,
     random_state: Optional[int] = 123,  # reproducibility only
-    stump_penalty: float = 1.0,  # added to loss if the tree makes no split
-    tie_break_eps: float = 1e-6,  # tiny factor for lexicographic tie-break
 ):
     import optuna
 
@@ -290,8 +227,8 @@ def tune_with_optuna_partial(
         try:
             tree.fit(X_tr, T_tr, YF_tr, YC_tr)
 
-            # 1) Base: standardized consistency loss (lower is better)
-            base_loss = evaluate_tree_consistency(
+            # Standardized consistency loss (lower is better)
+            loss = evaluate_tree_consistency(
                 tree,
                 X_val,
                 T_val,
@@ -300,15 +237,6 @@ def tune_with_optuna_partial(
                 nan_penalty=1.0,
                 weight_by="val",  # or "both"
             )
-
-            # 2) Stump penalty (discourage trivial trees)
-            is_stump = tree.root_.feature is None
-            base_loss += stump_penalty if is_stump else 0.0
-
-            # 3) Lexicographic tie-break toward stronger (di)vergence on validation
-            #    We subtract a tiny epsilon * bonus so primary optimization remains the loss.
-            B = validation_comovement_bonus(tree, X_val, T_val, YF_val, YC_val)
-            loss = base_loss - (tie_break_eps * B)
 
             return loss if np.isfinite(loss) else 1e6
 
