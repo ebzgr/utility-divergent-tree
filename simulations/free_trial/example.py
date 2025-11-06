@@ -20,7 +20,6 @@ from helper import (
 )
 from config import DataGenerationConfig, AnalysisConfig, FreeTrialConfig
 from divtree.tree import DivergenceTree
-from divtree.tune import tune_with_optuna_partial
 from divtree.viz import plot_divergence_tree
 
 # ===================== GLOBAL PATHS =====================
@@ -39,13 +38,13 @@ def run_example():
             N_USERS=100000,  # Smaller dataset for faster testing
             N_FEATURES=50,
             NOISE_SCALE=1.0,
-            USEFULNESS_BIPOLARITY=2,
+            USEFULNESS_BIPOLARITY=1,
             NOVELTY_BIPOLARITY=2,
             SUNK_COST_BIPOLARITY=2,
         ),
         analysis=AnalysisConfig(
             N_TUNING_TRIALS=20,
-            LAMBDA_=2,
+            LAMBDA_=1,
         ),
     )
 
@@ -70,10 +69,18 @@ def run_example():
     X, L, T, YF, YC, P_short, P_long, pi = generate_data(**params)
 
     # Descriptive analysis of the generated data
-    print("Data Summary")
+    print("\n" + "=" * 60)
+    print("DATA SUMMARY")
+    print("=" * 60)
     print_summary(YF, T, L)
+
+    print("\n" + "=" * 60)
+    print("GROUP TABLE: Average Outcomes by Latent Variables and Trial")
+    print("=" * 60)
     table = make_group_table_from_arrays(T, YF, YC, L["U"], L["N"], L["S"])
     print(table)
+
+    # Plot outcomes and subscription probability
     fig, axes = plot_six_panels_outcomes_and_pi(T, YF, YC, pi, L, nbins=20)
     # Create comprehensive DataFrame with all data
     df = pd.DataFrame(
@@ -104,63 +111,35 @@ def run_example():
     df.to_pickle(DATA_SAVE_ADDR)
     print(f"Data saved to: {DATA_SAVE_ADDR}")
 
-    # 3. Run analysis with the config
-    print("Running analysis...")
+    # 3. Run analysis with fixed parameters
+    print("\n" + "=" * 60)
+    print("TRAINING DIVERGENCE TREE")
+    print("=" * 60)
     analysis_config = config.analysis
 
-    # Fixed parameters
-    fixed = {
-        "honest": analysis_config.HONEST,
-        "min_leaf_treated": analysis_config.MIN_LEAF_TREATED,
-        "min_leaf_control": analysis_config.MIN_LEAF_CONTROL,
-        "min_leaf_conv_treated": analysis_config.MIN_LEAF_CONV_TREATED,
-        "min_leaf_conv_control": analysis_config.MIN_LEAF_CONV_CONTROL,
-        "random_state": analysis_config.RANDOM_STATE,
-        "co_movement": analysis_config.CO_MOVEMENT,
+    # Fixed parameters (for DivergenceTree)
+    tree_params = {
+        "max_partitions": 9,
+        "min_improvement_ratio": 0.01,
         "lambda_": analysis_config.LAMBDA_,
+        "n_quantiles": 50,
+        "random_state": analysis_config.RANDOM_STATE,
+        "co_movement": (
+            analysis_config.CO_MOVEMENT
+            if hasattr(analysis_config, "CO_MOVEMENT")
+            else "both"
+        ),
+        "eps_scale": 1e-8,
     }
 
-    # Search space
-    search_space = {
-        "max_depth": {
-            "type": "int",
-            "low": 0,
-            "high": 6,
-        },
-        "min_leaf_n": {
-            "type": "int",
-            "low": int(0.01 * X.shape[0]),
-            "high": int(0.1 * X.shape[0]),
-            "step": int(0.01 * X.shape[0]),
-        },
-        "n_quantiles": {
-            "type": "int",
-            "low": 32,
-            "high": 128,
-            "step": 32,
-        },
-    }
+    print(f"Tree parameters: {tree_params}")
 
-    # Tune hyperparameters
-    best_params, best_score = tune_with_optuna_partial(
-        X,
-        T,
-        YF,
-        YC,
-        fixed=fixed,
-        search_space=search_space,
-        valid_fraction=analysis_config.VALID_FRACTION,
-        n_trials=analysis_config.N_TUNING_TRIALS,
-        random_state=analysis_config.RANDOM_STATE,
-    )
-
-    # Build final tree
-    tree = DivergenceTree(**best_params)
+    # Build and train tree
+    print("\nTraining tree...")
+    tree = DivergenceTree(**tree_params)
     tree.fit(X, T, YF, YC)
 
-    print("Example complete!")
-    print(f"Best score: {best_score:.4f}")
-    print(f"Best params: {best_params}")
+    print("Tree training complete!")
 
     # Show the resulting tree
     print("\n" + "=" * 60)

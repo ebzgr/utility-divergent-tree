@@ -51,7 +51,7 @@ class DataGenerationConfig:
     SUNK_COST_LONG_WEIGHT: float = 1.0  # How much sunk cost affects long-term value
 
     # Subscription model parameters
-    BASELINE_SUBSCRIPTION: float = -0.7  # Baseline log-odds of subscription
+    BASELINE_SUBSCRIPTION: float = -0.8  # Baseline log-odds of subscription
     VALUE_SUBSCRIPTION_WEIGHT: float = (
         0.9  # How much perceived value affects subscription
     )

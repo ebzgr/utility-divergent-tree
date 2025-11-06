@@ -1,24 +1,52 @@
+"""
+Divergence Tree for two outcomes using recursive partitioning.
+
+This implementation grows a tree by recursively partitioning the feature space
+to identify regions with heterogeneous treatment effects on two outcomes:
+- YF: firm outcome (binary; e.g., subscription), observed for all units
+- YC: consumer outcome (continuous; observed only when YF == 1, otherwise NaN)
+
+The algorithm:
+1. Grows a maximal tree up to max_partitions leaves using global split selection
+2. Prunes the tree bottom-up, removing splits with improvement_ratio below threshold
+
+Hyperparameters:
+- max_partitions: Maximum number of leaves to grow
+- min_improvement_ratio: Minimum improvement ratio required to keep a split
+
+The split selection objective combines heterogeneity and co-movement:
+- Heterogeneity: H = zF² + zC²
+- Co-movement: d = zF * zC, with φ(d) depending on co_movement mode
+- Objective: g = H + λ * φ(d)
+
+where zF and zC are normalized deviations from baseline effects.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Any, Dict, List, Optional, Tuple
+
 import numpy as np
-from dataclasses import dataclass
-from typing import Optional, Tuple, Dict, Any
-from dataclasses import dataclass
-from concurrent.futures import as_completed
-import multiprocessing as mp
 
 
-# before:
-# @dataclass
-# after:
+# ---------------------------------------------------------------------
+# Data Classes
+# ---------------------------------------------------------------------
+
+
 @dataclass(eq=False)
 class TreeNode:
+    """Tree node with split rules and effect estimates."""
+
     depth: int
-    idx_split: np.ndarray  # indices used for split search (honesty: split half)
+    indices: np.ndarray  # Data indices reaching this node
     feature: Optional[int] = None
     threshold: Optional[float] = None
     left: Optional["TreeNode"] = None
     right: Optional["TreeNode"] = None
 
-    # effects estimated on estimate indices (honesty: estimate half)
+    # Effect estimates
     tauF: Optional[float] = None
     tauC: Optional[float] = None
     n: int = 0
@@ -26,180 +54,219 @@ class TreeNode:
     n_control: int = 0
 
 
+@dataclass
+class PartitionInfo:
+    """Information about a partition with its best potential split."""
+
+    leaf: TreeNode
+    best_split: Optional[Dict[str, Any]] = None
+    best_gain: float = -np.inf
+
+
+# ---------------------------------------------------------------------
+# Main DivergenceTree Class
+# ---------------------------------------------------------------------
+
+
 class DivergenceTree:
     """
-    Recursive partitioning to audit joint heterogeneity in firm-side and consumer-side
-    treatment effects.
+    Causal tree for heterogeneous treatment effects on two outcomes.
 
-    Split gain uses a *scaled* joint heterogeneity term plus a co-movement bonus:
-       H = ((tauF - parentF)/sF)^2 + ((tauC - parentC)/sC)^2
-       d = ((tauF - parentF)/sF) * ((tauC - parentC)/sC)
-       phi(d) = |d|      if co_movement == "both"
-                max(0,d) if co_movement == "converge"
-                max(0,-d) if co_movement == "diverge"
-       g = H + lambda_ * phi(d)
+    This class implements a recursive partitioning algorithm that identifies
+    regions with heterogeneous treatment effects on firm (YF) and consumer (YC)
+    outcomes. The tree grows maximally to max_partitions leaves, then prunes
+    splits with improvement_ratio below min_improvement_ratio.
 
-    Scales (sF, sC) are the parent-level standard errors of the diff-in-means
-    estimators, so each outcome contributes comparably.
+    Parameters
+    ----------
+    lambda_ : float, default=1.0
+        Weight for co-movement term in objective function.
+    max_partitions : int, default=8
+        Maximum number of leaves to grow before pruning.
+    min_improvement_ratio : float, default=0.01
+        Minimum improvement ratio required to keep a split during pruning.
+    n_quantiles : int, default=32
+        Number of quantiles to consider for continuous feature splits.
+    random_state : int, optional
+        Random seed for reproducibility (currently unused).
+    co_movement : {'both', 'converge', 'diverge'}, default='both'
+        Co-movement mode: 'both' (any alignment), 'converge' (both positive),
+        'diverge' (opposite signs).
+    eps_scale : float, default=1e-8
+        Minimum scale value to avoid division by zero.
+
+    Attributes
+    ----------
+    root_ : TreeNode, optional
+        Root node of the fitted tree. None before fit() is called.
+    _fit_data : dict
+        Internal storage for training data (X, T, YF, YC, indices).
+    _root_baseline : dict
+        Root-level treatment effects and scales used for objective calculation.
     """
 
     def __init__(
         self,
         lambda_: float = 1.0,
-        max_depth: int = 4,
-        min_leaf_n: int = 100,
-        min_leaf_treated: int = 1,
-        min_leaf_control: int = 1,
-        min_leaf_conv_treated: int = 1,
-        min_leaf_conv_control: int = 1,
-        honest: bool = True,
+        max_partitions: int = 8,
+        min_improvement_ratio: float = 0.01,
         n_quantiles: int = 32,
         random_state: Optional[int] = None,
-        n_workers: int = -1,
-        co_movement: str = "both",  # NEW: {"both","diverge","converge"}
-        eps_scale: float = 1e-8,  # NEW: numerical floor for scales
+        co_movement: str = "both",
+        eps_scale: float = 1e-8,
     ):
         self.lambda_ = float(lambda_)
-        self.max_depth = int(max_depth)
-        self.min_leaf_n = int(min_leaf_n)
-        self.min_leaf_treated = int(min_leaf_treated)
-        self.min_leaf_control = int(min_leaf_control)
-        self.min_leaf_conv_treated = int(min_leaf_conv_treated)
-        self.min_leaf_conv_control = int(min_leaf_conv_control)
-        self.honest = bool(honest)
+        self.max_partitions = int(max_partitions)
+        self.min_improvement_ratio = float(min_improvement_ratio)
         self.n_quantiles = int(n_quantiles)
         self.random_state = random_state
-        self.n_workers = int(n_workers)
-
-        # --- NEW: co-movement mode + scaling epsilon
-        co_movement = (co_movement or "both").lower()
-        if co_movement not in {"both", "diverge", "converge"}:
-            raise ValueError(
-                "co_movement must be one of {'both','diverge','converge'}."
-            )
-        self.co_movement = co_movement
         self.eps_scale = float(eps_scale)
+
+        cm = (co_movement or "both").lower()
+        if cm not in {"both", "converge", "diverge"}:
+            raise ValueError(
+                "co_movement must be one of {'both','converge','diverge'}."
+            )
+        self.co_movement = cm
 
         self.root_: Optional[TreeNode] = None
         self._fit_data: Dict[str, Any] = {}
+        self._root_baseline: Dict[str, float] = {}
 
     # ---------------- Public API ----------------
 
-    def fit(self, X, T, YF, YC):
+    def fit(
+        self, X: np.ndarray, T: np.ndarray, YF: np.ndarray, YC: np.ndarray
+    ) -> "DivergenceTree":
         """
-        X: features (n,p)
-        T: treatment in {0,1}
-        YF: firm outcome in {0,1}; YC must be np.nan when YF==0
-        YC: consumer outcome (float) for converters only (YF==1)
-        """
-        X = np.asarray(X)
-        T = np.asarray(T)
-        YF = np.asarray(YF)
-        YC = np.asarray(YC)
+        Fit the tree on data.
 
-        # --- Input checks ---
+        Parameters
+        ----------
+        X : np.ndarray of shape (n_samples, n_features)
+            Feature matrix.
+        T : np.ndarray of shape (n_samples,)
+            Treatment indicator (0 or 1).
+        YF : np.ndarray of shape (n_samples,)
+            Firm outcome (binary, observed for all units).
+        YC : np.ndarray of shape (n_samples,)
+            Consumer outcome (continuous, NaN where YF == 0).
+
+        Returns
+        -------
+        self : DivergenceTree
+            Returns self for method chaining.
+
+        Raises
+        ------
+        ValueError
+            If T contains values other than 0 or 1, or if YC is not NaN
+            where YF == 0, or if YC is not finite where YF == 1, or if
+            input arrays have mismatched lengths.
+        """
+        X, T, YF, YC = map(np.asarray, (X, T, YF, YC))
+
+        # Input validation
+        n = X.shape[0]
+        if len(T) != n or len(YF) != n or len(YC) != n:
+            raise ValueError(
+                f"Input arrays must have matching lengths: "
+                f"X={n}, T={len(T)}, YF={len(YF)}, YC={len(YC)}"
+            )
+
         if not np.all(np.isin(T, [0, 1])):
-            raise ValueError("T must contain only {0,1} values.")
+            raise ValueError("T must be in {0,1}.")
         non_conv_mask = YF == 0
         if not np.all(np.isnan(YC[non_conv_mask])):
-            raise ValueError("YC must be np.nan where YF==0 (non-converters).")
+            raise ValueError("YC must be NaN where YF == 0 (non-converters).")
         conv_mask = YF == 1
         if not np.all(np.isfinite(YC[conv_mask])):
-            raise ValueError("YC must be finite where YF==1 (converters).")
+            raise ValueError("YC must be finite where YF == 1 (converters).")
 
-        n, p = X.shape
-        rng = np.random.default_rng(self.random_state)
         all_idx = np.arange(n)
 
-        # --- Honesty split ---
-        if self.honest:
-            mask = rng.integers(0, 2, size=n).astype(bool)
-            # ensure both sides non-empty
-            if mask.sum() == 0 or (~mask).sum() == 0:
-                rng.shuffle(all_idx)
-                half = n // 2
-                idx_split = all_idx[:half]
-                idx_est = all_idx[half:]
-            else:
-                idx_split = all_idx[mask]
-                idx_est = all_idx[~mask]
-        else:
-            idx_split = all_idx
-            idx_est = all_idx
+        # Store fit data
+        self._fit_data = dict(
+            X=X,
+            T=T,
+            YF=YF,
+            YC=YC,
+            indices=all_idx,
+        )
 
-        # --- Store fit data BEFORE any estimation ---
-        self._fit_data = {
-            "X": X,
-            "T": T,
-            "YF": YF,
-            "YC": YC,
-            "idx_split": idx_split,
-            "idx_est": idx_est,
-        }
-
-        # --- Build root node & estimate root effects (on estimation set) ---
-        self.root_ = TreeNode(depth=0, idx_split=idx_split)
-        tauF, tauC, n_leaf, nt, nc = self._estimate_effects(idx_est)
+        # Initialize root node
+        self.root_ = TreeNode(depth=0, indices=all_idx)
+        tauF, tauC, n_leaf, nt, nc = self._estimate_effects(all_idx)
         self.root_.tauF, self.root_.tauC = tauF, tauC
         self.root_.n, self.root_.n_treated, self.root_.n_control = n_leaf, nt, nc
 
-        # --- Grow recursively ---
-        self._grow(self.root_)
+        # Compute root baseline for 'global' baseline mode
+        root_tauF, root_tauC, _, _, _ = self._estimate_effects(all_idx)
+        root_sF, root_sC = self._compute_scales(all_idx)
+        self._root_baseline = dict(
+            tauF=root_tauF,
+            tauC=root_tauC,
+            sF=root_sF,
+            sC=root_sC,
+        )
+
+        # Grow maximally to max_partitions
+        self._grow()
+
+        # Prune based on improvement_ratio
+        self._prune()
+
         return self
 
-    def predict_leaf(self, X: np.ndarray):
-        """Return the leaf node object for each row in X."""
+    def predict_leaf(self, X: np.ndarray) -> np.ndarray:
+        """
+        Return leaf node for each sample in X.
+
+        Parameters
+        ----------
+        X : np.ndarray of shape (n_samples, n_features)
+            Feature matrix.
+
+        Returns
+        -------
+        np.ndarray of shape (n_samples,)
+            Array of TreeNode objects, one for each sample's leaf node.
+        """
         X = np.asarray(X)
 
-        def traverse(x, node: TreeNode):
+        def descend(x, node: TreeNode) -> TreeNode:
             if node.feature is None or node.left is None or node.right is None:
                 return node
-            return traverse(
-                x, node.left if x[node.feature] <= node.threshold else node.right
-            )
+            if x[node.feature] <= node.threshold:
+                return descend(x, node.left)
+            return descend(x, node.right)
 
-        out = []
-        for i in range(X.shape[0]):
-            out.append(traverse(X[i], self.root_))
-        return np.array(out, dtype=object)
-
-    def export_text(self) -> str:
-        lines = []
-
-        def rec(node: TreeNode, indent=""):
-            if node is None:
-                return
-            if node.feature is None:
-                lines.append(
-                    f"{indent}Leaf(depth={node.depth}): "
-                    f"tauF={_fmt(node.tauF)}, tauC={_fmt(node.tauC)}, "
-                    f"n={node.n}, n1={node.n_treated}, n0={node.n_control}"
-                )
-                return
-            lines.append(f"{indent}X[{node.feature}] <= {node.threshold:.6f}?")
-            rec(node.left, indent + "  ")
-            lines.append(f"{indent}else:")
-            rec(node.right, indent + "  ")
-
-        rec(self.root_)
-        return "\n".join(lines)
+        return np.array([descend(x, self.root_) for x in X], dtype=object)
 
     def leaf_effects(self) -> Dict[str, Any]:
-        leaves = []
+        """
+        Return summary of all leaf effects and statistics.
 
-        def collect(node: TreeNode):
-            if node is None:
+        Returns
+        -------
+        dict
+            Dictionary with 'leaves' key containing list of leaf dictionaries.
+            Each leaf dict has: leaf_id, depth, tauF, tauC, n, n_treated, n_control.
+        """
+        leaves: List[TreeNode] = []
+
+        def collect(n: Optional[TreeNode]):
+            if n is None:
                 return
-            if node.left is None and node.right is None:
-                leaves.append(node)
+            if n.left is None and n.right is None:
+                leaves.append(n)
             else:
-                collect(node.left)
-                collect(node.right)
+                collect(n.left)
+                collect(n.right)
 
         collect(self.root_)
-        out = []
-        for i, leaf in enumerate(leaves):
-            out.append(
+        return {
+            "leaves": [
                 dict(
                     leaf_id=i,
                     depth=leaf.depth,
@@ -209,424 +276,507 @@ class DivergenceTree:
                     n_treated=leaf.n_treated,
                     n_control=leaf.n_control,
                 )
+                for i, leaf in enumerate(leaves)
+            ]
+        }
+
+    # ===============================================================
+    # Tree Growth (Maximal Tree Construction)
+    # ===============================================================
+
+    def _grow(self):
+        """Efficient global split selection across all partitions."""
+        # Initialize with root partition
+        partitions = [PartitionInfo(leaf=self.root_)]
+
+        # Pre-compute best split for root
+        self._update_best_split_for_partition(partitions[0])
+
+        while len(partitions) < self.max_partitions:
+            # Check if we have any partitions
+            if not partitions:
+                break
+
+            # Find partition with globally best split
+            best_idx = max(
+                range(len(partitions)), key=lambda i: partitions[i].best_gain
             )
-        return {"leaves": out}
+            best_partition = partitions[best_idx]
 
-    # --------------- Core tree building ----------------
+            if best_partition.best_gain <= 0:
+                break  # No good splits available
 
-    def _grow(self, node: TreeNode):
-        if node.depth >= self.max_depth:
+            # Apply the best split
+            self._apply_split_to_partition(best_partition)
+
+            # Update partitions list
+            partitions = self._update_partitions_after_split(partitions, best_idx)
+
+    def _update_best_split_for_partition(self, partition: PartitionInfo):
+        """Find and store the best split for a given partition."""
+        leaf = partition.leaf
+
+        # Generate all split candidates for this partition
+        candidates = self._generate_split_candidates_for_leaf(leaf)
+
+        if not candidates:
+            partition.best_split = None
+            partition.best_gain = -np.inf
             return
 
+        # Evaluate all candidates and find best
+        best_gain = -np.inf
+        best_split = None
+
+        for candidate in candidates:
+            result = self._evaluate_split_candidate(
+                candidate["feature"],
+                candidate["threshold"],
+                candidate["x_split"],
+                leaf.indices,
+                leaf,
+            )
+            if result is not None and result["gain"] > best_gain:
+                best_gain = result["gain"]
+                best_split = result
+
+        # Store results
+        partition.best_split = best_split
+        partition.best_gain = best_gain
+
+    def _generate_split_candidates_for_leaf(
+        self, leaf: TreeNode
+    ) -> List[Dict[str, Any]]:
+        """Generate all possible split candidates for a given leaf."""
         X = self._fit_data["X"]
-        idx_split = node.idx_split
-        idx_est_all = self._fit_data["idx_est"]
+        indices = leaf.indices
 
-        # parent effects on routed estimation indices
-        est_idx_parent = idx_est_all[self._route_mask(idx_est_all, upto=node)]
-        parent_tauF, parent_tauC, _, _, _ = self._estimate_effects(est_idx_parent)
-        if not (np.isfinite(parent_tauF) and np.isfinite(parent_tauC)):
-            return
-
-        # --- NEW: compute parent-level scales for normalization ---
-        sF, sC = self._compute_scales(est_idx_parent)
-        # Guard-rail: if scales are degenerate, stop splitting
-        if not (np.isfinite(sF) and np.isfinite(sC)) or (sF <= 0 or sC <= 0):
-            return
-
+        candidates = []
         p = X.shape[1]
 
-        # Prepare tasks for parallel processing
-        tasks = []
         for f in range(p):
-            x_split = X[idx_split, f]
+            x_split = X[indices, f]
             if np.unique(x_split).size <= 1:
                 continue
-
-            # candidate thresholds: quantiles over split sample
             qs = np.linspace(0, 1, self.n_quantiles + 2)[1:-1]
             thresholds = np.unique(np.quantile(x_split, qs, method="nearest"))
-            if thresholds.size == 0:
-                continue
-
             for thr in thresholds:
-                tasks.append((f, thr, x_split))
+                candidates.append(
+                    {
+                        "feature": f,
+                        "threshold": float(thr),
+                        "x_split": x_split,
+                    }
+                )
 
-        # Process tasks in parallel
-        best_gain = -np.inf
-        best = None
+        return candidates
 
-        if tasks:
-            from concurrent.futures import ThreadPoolExecutor
+    def _apply_split_to_partition(self, partition: PartitionInfo):
+        """Apply the best split to a partition."""
+        leaf = partition.leaf
+        best_split = partition.best_split
 
-            n_workers = (
-                mp.cpu_count()
-                if self.n_workers == -1
-                else min(self.n_workers, len(tasks))
-            )
-            with ThreadPoolExecutor(max_workers=n_workers) as executor:
-                futures = []
-                for f, thr, x_split in tasks:
-                    future = executor.submit(
-                        self._evaluate_split_candidate,
-                        f,
-                        thr,
-                        x_split,
-                        idx_split,
-                        idx_est_all,
-                        node,
-                        parent_tauF,
-                        parent_tauC,
-                        sF,  # NEW: pass scales
-                        sC,
-                    )
-                    futures.append(future)
-
-                for future in as_completed(futures):
-                    try:
-                        result = future.result()
-                        if result is not None and result["gain"] > best_gain:
-                            best_gain = result["gain"]
-                            best = result
-                    except Exception:
-                        continue
-
-        if best is None or best_gain <= 0:
+        if best_split is None:
             return
 
-        # apply best split
-        f = best["feature"]
-        thr = best["threshold"]
-        left_node = TreeNode(
-            depth=node.depth + 1, idx_split=node.idx_split[best["left_mask_split"]]
+        # Apply split to the leaf (improvement_ratio computed during pruning)
+        leaf.feature = best_split["feature"]
+        leaf.threshold = best_split["threshold"]
+
+        # Create children
+        left_mask = best_split["left_mask"]
+        right_mask = best_split["right_mask"]
+        leaf.left = TreeNode(
+            depth=leaf.depth + 1,
+            indices=leaf.indices[left_mask],
         )
-        right_node = TreeNode(
-            depth=node.depth + 1, idx_split=node.idx_split[best["right_mask_split"]]
+        leaf.right = TreeNode(
+            depth=leaf.depth + 1,
+            indices=leaf.indices[right_mask],
         )
 
-        node.feature = f
-        node.threshold = thr
-        node.left = left_node
-        node.right = right_node
+        # Compute leaf estimates
+        for child, child_indices in [
+            (leaf.left, leaf.indices[left_mask]),
+            (leaf.right, leaf.indices[right_mask]),
+        ]:
+            tauF, tauC, n, nt, nc = self._estimate_effects(child_indices)
+            child.tauF, child.tauC = tauF, tauC
+            child.n, child.n_treated, child.n_control = n, nt, nc
 
-        # set child effects (estimated on their estimation indices)
-        (
-            left_node.tauF,
-            left_node.tauC,
-            left_node.n,
-            left_node.n_treated,
-            left_node.n_control,
-        ) = self._estimate_effects(best["idx_est_L"])
-        (
-            right_node.tauF,
-            right_node.tauC,
-            right_node.n,
-            right_node.n_treated,
-            right_node.n_control,
-        ) = self._estimate_effects(best["idx_est_R"])
+    def _update_partitions_after_split(
+        self, partitions: List[PartitionInfo], split_idx: int
+    ) -> List[PartitionInfo]:
+        """Update partitions after a split, only re-computing affected ones."""
+        # Get the split partition
+        split_partition = partitions[split_idx]
 
-        # recurse
-        self._grow(left_node)
-        self._grow(right_node)
+        # Create new partitions list without the split partition
+        new_partitions = partitions[:split_idx] + partitions[split_idx + 1 :]
 
-    # --------------- helpers ----------------
+        # Add the two new child partitions
+        left_leaf = split_partition.leaf.left
+        right_leaf = split_partition.leaf.right
+
+        left_partition = PartitionInfo(leaf=left_leaf)
+        right_partition = PartitionInfo(leaf=right_leaf)
+
+        # Only compute best splits for the two new partitions
+        self._update_best_split_for_partition(left_partition)
+        self._update_best_split_for_partition(right_partition)
+
+        # Add the two new partitions
+        new_partitions.extend([left_partition, right_partition])
+
+        return new_partitions
 
     def _evaluate_split_candidate(
         self,
         feature: int,
         threshold: float,
         x_split: np.ndarray,
-        idx_split: np.ndarray,
-        idx_est_all: np.ndarray,
+        indices: np.ndarray,
         node: TreeNode,
-        parent_tauF: float,
-        parent_tauC: float,
-        sF: float,  # NEW
-        sC: float,  # NEW
-    ) -> Optional[Dict]:
-        """Evaluate a single split candidate and return the result if valid."""
-        left_mask_split = x_split <= threshold
-        right_mask_split = ~left_mask_split
+    ) -> Optional[Dict[str, Any]]:
+        """Evaluate single split candidate and return gain if feasible."""
+        left_mask = x_split <= threshold
+        right_mask = ~left_mask
 
-        if (
-            left_mask_split.sum() < self.min_leaf_n
-            or right_mask_split.sum() < self.min_leaf_n
-        ):
+        # Check minimal feasibility (at least 2 obs per side)
+        if left_mask.sum() < 2 or right_mask.sum() < 2:
             return None
 
-        # route estimation indices with the candidate extra rule
-        left_mask_est = self._route_mask(
-            idx_est_all, upto=node, extra_rule=(feature, float(threshold), True)
-        )
-        right_mask_est = self._route_mask(
-            idx_est_all, upto=node, extra_rule=(feature, float(threshold), False)
-        )
-        idx_est_L = idx_est_all[left_mask_est]
-        idx_est_R = idx_est_all[right_mask_est]
-
-        # feasibility checks on estimation set
-        if not (self._feasible(idx_est_L) and self._feasible(idx_est_R)):
+        # Compute child effects
+        indices_L = indices[left_mask]
+        indices_R = indices[right_mask]
+        tauF_L, tauC_L, nL, _, _ = self._estimate_effects(indices_L)
+        tauF_R, tauC_R, nR, _, _ = self._estimate_effects(indices_R)
+        if not all(map(np.isfinite, [tauF_L, tauC_L, tauF_R, tauC_R])):
             return None
 
-        tauF_L, tauC_L, nL, _, _ = self._estimate_effects(idx_est_L)
-        tauF_R, tauC_R, nR, _, _ = self._estimate_effects(idx_est_R)
-        if not (
-            np.isfinite(tauF_L)
-            and np.isfinite(tauC_L)
-            and np.isfinite(tauF_R)
-            and np.isfinite(tauC_R)
-        ):
-            return None
+        # Get root baseline (always used)
+        root_tauF = self._root_baseline.get("tauF", 0.0)
+        root_tauC = self._root_baseline.get("tauC", 0.0)
+        root_sF = self._root_baseline.get("sF", 1.0)
+        root_sC = self._root_baseline.get("sC", 1.0)
 
-        wL = nL / (nL + nR)
-        wR = 1.0 - wL
-
-        # parent g is zero by construction (centered), but keep call for clarity
-        g_parent = self._g(parent_tauF, parent_tauC, parent_tauF, parent_tauC, sF, sC)
-        g_left = self._g(tauF_L, tauC_L, parent_tauF, parent_tauC, sF, sC)
-        g_right = self._g(tauF_R, tauC_R, parent_tauF, parent_tauC, sF, sC)
-        gain = wL * g_left + wR * g_right - g_parent
-
+        # Calculate weighted objective using root baseline
+        gL, compL = self._g(tauF_L, tauC_L, root_tauF, root_tauC, root_sF, root_sC)
+        gR, compR = self._g(tauF_R, tauC_R, root_tauF, root_tauC, root_sF, root_sC)
+        gain = nL * gL + nR * gR
         if gain <= 0:
             return None
 
         return dict(
             feature=feature,
-            threshold=float(threshold),
-            left_mask_split=left_mask_split,
-            right_mask_split=right_mask_split,
-            idx_est_L=idx_est_L,
-            idx_est_R=idx_est_R,
-            tauF_L=tauF_L,
-            tauC_L=tauC_L,
-            tauF_R=tauF_R,
-            tauC_R=tauC_R,
+            threshold=threshold,
+            left_mask=left_mask,
+            right_mask=right_mask,
             gain=gain,
+            nL=int(nL),
+            nR=int(nR),
+            components_L=compL,
+            components_R=compR,
         )
+
+    # ===============================================================
+    # Pruning System
+    # ===============================================================
+
+    def _prune(self):
+        """
+        Prune tree bottom-up, removing splits with improvement_ratio < min_improvement_ratio.
+
+        For each internal node:
+        1. Compute total objective with the split (current state)
+        2. Compute total objective without the split (if we prune it)
+        3. improvement_ratio = (objective_with_split - objective_without_split) / objective_without_split
+        4. If improvement_ratio < min_improvement_ratio, prune it
+        5. Continue recursively until no more splits can be pruned
+        """
+        # Keep pruning until no more splits can be removed
+        while True:
+            # Collect leaf parent nodes (nodes whose children are both leaves)
+            leaf_parent_nodes = self._collect_leaf_parent_nodes()
+
+            if not leaf_parent_nodes:
+                break  # No more leaf parent nodes to check
+
+            # Find the node with smallest improvement_ratio
+            best_node = None
+            best_ratio = np.inf
+
+            for node in leaf_parent_nodes:
+                improvement_ratio = self._compute_improvement_ratio_for_node(node)
+                if improvement_ratio < best_ratio:
+                    best_ratio = improvement_ratio
+                    best_node = node
+
+            # If the best improvement_ratio is below threshold, prune it
+            if best_node is not None and best_ratio < self.min_improvement_ratio:
+                self._prune_node_to_leaf(best_node)
+            else:
+                break  # No more splits to prune
+
+    def _collect_leaf_parent_nodes(self) -> List[TreeNode]:
+        """
+        Collect nodes whose children are both leaves (leaf parents).
+
+        These are the nodes that directly parent leaves, which are the only
+        nodes that need to be checked for pruning, as the node with smallest
+        improvement_ratio will always be a leaf parent.
+        """
+        leaf_parents = []
+
+        def traverse(node: Optional[TreeNode]):
+            if node is None:
+                return
+            if node.left is not None and node.right is not None:
+                # Check if both children are leaves
+                left_is_leaf = node.left.left is None and node.left.right is None
+                right_is_leaf = node.right.left is None and node.right.right is None
+
+                if left_is_leaf and right_is_leaf:
+                    # Both children are leaves - this is a leaf parent
+                    leaf_parents.append(node)
+                else:
+                    # Recurse to children to find leaf parents deeper in the tree
+                    traverse(node.left)
+                    traverse(node.right)
+
+        traverse(self.root_)
+        return leaf_parents
+
+    def _compute_improvement_ratio_for_node(self, node: TreeNode) -> float:
+        """
+        Compute improvement_ratio for a split node.
+
+        improvement_ratio = (objective_with_split - objective_without_split) / objective_without_split
+
+        where:
+        - objective_with_split = current total objective (with this split)
+        - objective_without_split = total objective if we prune this node (merge children)
+        """
+        if node.left is None or node.right is None:
+            return np.inf  # Not a split node
+
+        # Compute total objective with the split (current state)
+        objective_with_split = self._compute_total_objective()
+
+        # Compute total objective without the split (treat this node as a leaf)
+        objective_without_split = self._compute_total_objective(prune_node=node)
+
+        if objective_without_split <= 0:
+            return np.inf  # Avoid division by zero
+
+        # improvement_ratio = (with_split - without_split) / without_split
+        improvement_ratio = (
+            objective_with_split - objective_without_split
+        ) / objective_without_split
+
+        return improvement_ratio
+
+    def _compute_total_objective(
+        self, root: Optional[TreeNode] = None, prune_node: Optional[TreeNode] = None
+    ) -> float:
+        """
+        Compute total objective value across all leaves in the tree.
+
+        Parameters
+        ----------
+        root : TreeNode, optional
+            Root node of the tree to evaluate. If None, uses self.root_
+        prune_node : TreeNode, optional
+            If provided, treat this node as a leaf (skip its children).
+            Used to simulate pruning without copying the tree.
+
+        Returns
+        -------
+        float
+            Total objective value (sum of n * g for all leaves)
+        """
+        # Use self.root_ if root parameter is not provided
+        root = root if root is not None else self.root_
+
+        # Collect all leaves (treating prune_node as a leaf if specified)
+        leaves = []
+
+        def collect_leaves(node: Optional[TreeNode], prune_target: Optional[TreeNode]):
+            if node is None:
+                return
+            # If this is the node to prune, treat it as a leaf
+            if node is prune_target:
+                leaves.append(node)
+                return
+            if node.left is None and node.right is None:
+                leaves.append(node)
+            else:
+                collect_leaves(node.left, prune_target)
+                collect_leaves(node.right, prune_target)
+
+        collect_leaves(root, prune_node)
+
+        # Compute total objective
+        total = 0.0
+        root_tauF = self._root_baseline.get("tauF", 0.0)
+        root_tauC = self._root_baseline.get("tauC", 0.0)
+        root_sF = self._root_baseline.get("sF", 1.0)
+        root_sC = self._root_baseline.get("sC", 1.0)
+
+        for leaf in leaves:
+            # For pruned node, compute merged effect from all data in the node
+            if leaf is prune_node:
+                tauF, tauC = self._estimate_effects(leaf.indices)[:2]
+            else:
+                tauF, tauC = leaf.tauF, leaf.tauC
+
+            if tauF is not None and tauC is not None:
+                g, _ = self._g(tauF, tauC, root_tauF, root_tauC, root_sF, root_sC)
+                total += leaf.n * g
+
+        return total
+
+    def _prune_node_to_leaf(self, node: TreeNode):
+        """Prune a node to a leaf by removing its children."""
+        # Recompute leaf estimates using all data in this node
+        tauF, tauC, n, nt, nc = self._estimate_effects(node.indices)
+        node.tauF, node.tauC = tauF, tauC
+        node.n, node.n_treated, node.n_control = n, nt, nc
+
+        # Remove split information
+        node.feature = None
+        node.threshold = None
+        node.left = None
+        node.right = None
+
+    # ===============================================================
+    # Objective Function and Utilities
+    # ===============================================================
 
     def _g(
         self,
         tauF: float,
         tauC: float,
-        parent_tauF: float,
-        parent_tauC: float,
+        base_tauF: float,
+        base_tauC: float,
         sF: float,
         sC: float,
-    ) -> float:
+    ) -> Tuple[float, Dict[str, float]]:
         """
-        Node scoring function.
+        Compute objective function and return components for debugging.
 
-        Effects are centered and standardized by their parent-node standard errors
-        (sF, sC) before computing the heterogeneity and co-movement terms.
-        This parent-level scaling ensures both outcomes contribute comparably to
-        the split decision regardless of their raw scales, so a single global λ
-        remains meaningful throughout the tree.
+        The objective function combines heterogeneity and co-movement:
+        g = zF² + zC² + λ * φ(zF * zC)
+
+        where:
+        - zF = (tauF - base_tauF) / sF
+        - zC = (tauC - base_tauC) / sC
+        - φ depends on co_movement mode
+
+        Returns:
+            Tuple of (objective_value, components_dict)
         """
-        if not (
-            np.isfinite(tauF)
-            and np.isfinite(tauC)
-            and np.isfinite(parent_tauF)
-            and np.isfinite(parent_tauC)
-        ):
-            return -np.inf
-
-        # centered & scaled deviations
-        zF = (tauF - parent_tauF) / max(sF, self.eps_scale)
-        zC = (tauC - parent_tauC) / max(sC, self.eps_scale)
-
-        H = zF**2 + zC**2
-        d = zF * zC  # centered cross-moment (covariance-like)
-
+        if not (np.isfinite(tauF) and np.isfinite(tauC)):
+            return -np.inf, {
+                "zF2": np.nan,
+                "zC2": np.nan,
+                "phi": np.nan,
+                "g": -np.inf,
+                "tauF": tauF,
+                "tauC": tauC,
+                "base_tauF": base_tauF,
+                "base_tauC": base_tauC,
+                "sF": sF,
+                "sC": sC,
+            }
+        zF = (tauF - base_tauF) / max(sF, self.eps_scale)
+        zC = (tauC - base_tauC) / max(sC, self.eps_scale)
+        zF2 = float(zF**2)
+        zC2 = float(zC**2)
+        d = zF * zC
         if self.co_movement == "both":
-            phi = abs(d)
+            phi = float(abs(d))
         elif self.co_movement == "converge":
-            phi = max(0.0, d)
-        else:  # "diverge"
-            phi = max(0.0, -d)
-
-        return H + self.lambda_ * phi
+            phi = float(max(0.0, d))
+        else:
+            phi = float(max(0.0, -d))
+        g = float(zF2 + zC2 + self.lambda_ * phi)
+        return g, {
+            "zF2": zF2,
+            "zC2": zC2,
+            "phi": phi,
+            "g": g,
+            "tauF": tauF,
+            "tauC": tauC,
+            "base_tauF": base_tauF,
+            "base_tauC": base_tauC,
+            "sF": sF,
+            "sC": sC,
+        }
 
     def _compute_scales(self, idx: np.ndarray) -> Tuple[float, float]:
         """
-        Parent-level scales (standard errors) for diff-in-means:
-          sF = sqrt( Var(YF|T=1)/n1 + Var(YF|T=0)/n0 )
-          sC = sqrt( Var(YC|T=1,YF=1)/c1 + Var(YC|T=0,YF=1)/c0 )
-        These make H and d approximately scale-free across outcomes.
+        Compute standard errors for difference-in-means treatment effect estimates.
+
+        The scales normalize the objective function so firm and consumer effects
+        contribute comparably. For tau = mean(Y|T=1) - mean(Y|T=0):
+        Var(tau) = Var(Y|T=1)/n1 + Var(Y|T=0)/n0, SE(tau) = sqrt(Var(tau))
         """
-        T = self._fit_data["T"]
-        YF = self._fit_data["YF"]
-        YC = self._fit_data["YC"]
+        T, YF, YC = (
+            self._fit_data["T"],
+            self._fit_data["YF"],
+            self._fit_data["YC"],
+        )
+        sub_T, sub_YF, sub_YC = T[idx], YF[idx], YC[idx]
+        treated, control = (sub_T == 1), (sub_T == 0)
+        n1, n0 = treated.sum(), control.sum()
 
-        sub_T = T[idx]
-        sub_YF = YF[idx]
-        sub_YC = YC[idx]
+        # Firm outcome: binary (Bernoulli) variance p(1-p)
+        # Var(tauF) = p1(1-p1)/n1 + p0(1-p0)/n0
+        p1 = sub_YF[treated].mean() if n1 > 0 else 0.0
+        p0 = sub_YF[control].mean() if n0 > 0 else 0.0
+        var1 = p1 * (1 - p1) if n1 > 0 else 0.0
+        var0 = p0 * (1 - p0) if n0 > 0 else 0.0
+        sF2 = max(var1 / max(n1, 1) + var0 / max(n0, 1), self.eps_scale)
 
-        treated = sub_T == 1
-        control = ~treated
-
-        n1 = treated.sum()
-        n0 = control.sum()
-
-        # Firm-side: Bernoulli variance p*(1-p)
-        # Guard against empty arms
-        if n1 > 0:
-            p1 = float(sub_YF[treated].mean())
-            var1 = p1 * (1 - p1)
-        else:
-            var1 = np.nan
-        if n0 > 0:
-            p0 = float(sub_YF[control].mean())
-            var0 = p0 * (1 - p0)
-        else:
-            var0 = np.nan
-
-        sF2 = 0.0
-        if n1 > 0 and n0 > 0:
-            sF2 = var1 / max(n1, 1) + var0 / max(n0, 1)
-        sF = float(np.sqrt(max(sF2, self.eps_scale)))
-
-        # Consumer-side: among converters in each arm
+        # Consumer outcome: continuous variance (only for converters, YF==1)
+        # Var(tauC) = Var(YC|T=1,YF=1)/c1 + Var(YC|T=0,YF=1)/c0
         conv_treat = treated & (sub_YF == 1)
         conv_ctrl = control & (sub_YF == 1)
-        c1 = conv_treat.sum()
-        c0 = conv_ctrl.sum()
+        c1, c0 = conv_treat.sum(), conv_ctrl.sum()
+        varC1 = np.var(sub_YC[conv_treat], ddof=1) if c1 > 1 else 0.0
+        varC0 = np.var(sub_YC[conv_ctrl], ddof=1) if c0 > 1 else 0.0
+        sC2 = max(varC1 / max(c1, 1) + varC0 / max(c0, 1), self.eps_scale)
 
-        if c1 > 1:
-            varC1 = float(np.var(sub_YC[conv_treat], ddof=1))
-        elif c1 == 1:
-            varC1 = 0.0
-        else:
-            varC1 = np.nan
-
-        if c0 > 1:
-            varC0 = float(np.var(sub_YC[conv_ctrl], ddof=1))
-        elif c0 == 1:
-            varC0 = 0.0
-        else:
-            varC0 = np.nan
-
-        sC2 = 0.0
-        if c1 > 0 and c0 > 0:
-            sC2 = (varC1 / max(c1, 1)) + (varC0 / max(c0, 1))
-        sC = float(np.sqrt(max(sC2, self.eps_scale)))
-
-        return sF, sC
+        return float(np.sqrt(sF2)), float(np.sqrt(sC2))
 
     def _estimate_effects(self, idx: np.ndarray) -> Tuple[float, float, int, int, int]:
-        T = self._fit_data["T"]
-        YF = self._fit_data["YF"]
-        YC = self._fit_data["YC"]
-
-        sub_T = T[idx]
-        sub_YF = YF[idx]
-        sub_YC = YC[idx]
-
+        """Estimate treatment effects using difference-in-means."""
+        T, YF, YC = (
+            self._fit_data["T"],
+            self._fit_data["YF"],
+            self._fit_data["YC"],
+        )
+        sub_T, sub_YF, sub_YC = T[idx], YF[idx], YC[idx]
         n = idx.size
         treated = sub_T == 1
         control = ~treated
+        n1, n0 = treated.sum(), control.sum()
 
-        n1 = treated.sum()
-        n0 = control.sum()
+        # Firm effect (binary outcome)
+        tauF = np.nan
+        if n1 > 0 and n0 > 0:
+            tauF = float(sub_YF[treated].mean() - sub_YF[control].mean())
 
-        # firm-side: difference in means
-        if n1 == 0 or n0 == 0:
-            tauF = np.nan
-        else:
-            yF1 = sub_YF[treated].mean()
-            yF0 = sub_YF[control].mean()
-            tauF = yF1 - yF0
-
-        # consumer-side conditional on conversion in each arm
+        # Consumer effect (only for converters)
         conv_treat = treated & (sub_YF == 1)
         conv_ctrl = control & (sub_YF == 1)
-        c1 = conv_treat.sum()
-        c0 = conv_ctrl.sum()
-        if c1 == 0 or c0 == 0:
-            tauC = np.nan
-        else:
+        c1, c0 = conv_treat.sum(), conv_ctrl.sum()
+        tauC = np.nan
+        if c1 > 0 and c0 > 0:
             yC1 = sub_YC[conv_treat]
             yC0 = sub_YC[conv_ctrl]
-            yC1 = yC1[np.isfinite(yC1)]
-            yC0 = yC0[np.isfinite(yC0)]
-            if yC1.size == 0 or yC0.size == 0:
-                tauC = np.nan
-            else:
-                tauC = yC1.mean() - yC0.mean()
+            if np.isfinite(yC1).any() and np.isfinite(yC0).any():
+                tauC = float(np.nanmean(yC1) - np.nanmean(yC0))
 
-        return (
-            float(tauF) if np.isfinite(tauF) else np.nan,
-            float(tauC) if np.isfinite(tauC) else np.nan,
-            int(n),
-            int(n1),
-            int(n0),
-        )
-
-    def _feasible(self, idx: np.ndarray) -> bool:
-        T = self._fit_data["T"]
-        YF = self._fit_data["YF"]
-        sub_T = T[idx]
-        sub_YF = YF[idx]
-
-        if idx.size < self.min_leaf_n:
-            return False
-
-        n1 = (sub_T == 1).sum()
-        n0 = idx.size - n1
-        if n1 < self.min_leaf_treated or n0 < self.min_leaf_control:
-            return False
-
-        c1 = ((sub_T == 1) & (sub_YF == 1)).sum()
-        c0 = ((sub_T == 0) & (sub_YF == 1)).sum()
-        if c1 < self.min_leaf_conv_treated or c0 < self.min_leaf_conv_control:
-            return False
-
-        return True
-
-    def _route_mask(
-        self,
-        idx_pool: np.ndarray,
-        upto: TreeNode,
-        extra_rule: Optional[Tuple[int, float, bool]] = None,
-    ) -> np.ndarray:
-        """
-        Build a boolean mask over idx_pool selecting rows that would reach `upto`,
-        then optionally apply one more candidate rule (feature f, threshold thr, is_left).
-        """
-        X = self._fit_data["X"]
-        rules = self._path_rules(upto)
-        if extra_rule is not None:
-            rules = rules + [extra_rule]
-
-        mask = np.ones(idx_pool.size, dtype=bool)
-        for f, thr, is_left in rules:
-            mask &= (X[idx_pool, f] <= thr) if is_left else (X[idx_pool, f] > thr)
-        return mask
-
-    def _path_rules(self, target: TreeNode):
-        """
-        Reconstruct (feature, threshold, is_left) rules from root to target.
-        """
-        rules = []
-
-        def dfs(node: Optional[TreeNode], acc):
-            if node is None:
-                return False
-            if node is target:
-                rules.extend(acc)
-                return True
-            if node.feature is None:
-                return False
-            # try left
-            if dfs(node.left, acc + [(node.feature, node.threshold, True)]):
-                return True
-            # right
-            if dfs(node.right, acc + [(node.feature, node.threshold, False)]):
-                return True
-            return False
-
-        dfs(self.root_, [])
-        return rules
-
-
-def _fmt(x):
-    return "nan" if x is None or not np.isfinite(x) else f"{x:.4f}"
+        return tauF, tauC, int(n), int(n1), int(n0)

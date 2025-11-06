@@ -1,255 +1,220 @@
 """
-Tuning utilities for DivergenceTree.
+Hyperparameter tuning for DivergenceTree using Optuna.
 
-Assumptions:
-- Randomized treatment assignment (or unconfoundedness within node).
-- Firm outcome YF is Bernoulli; consumer outcome YC is numeric and only defined when YF==1.
-- Validation loss is standardized by validation SEs so firm/consumer contribute fairly.
-- Adds a stump penalty (discourages trivial trees).
+This module provides functions for tuning the divergence tree hyperparameters
+using cross-validated pseudo-outcome loss. The tuning process uses Optuna's
+TPE sampler to efficiently search the hyperparameter space.
 
-Public API:
-- tune_with_optuna_partial(...)
+Hyperparameters tuned:
+- max_partitions: Maximum number of leaves to grow
+- min_improvement_ratio: Minimum improvement ratio for keeping splits during pruning
+
+The evaluation metric is K-fold cross-validated pseudo-outcome MSE loss,
+which combines firm and consumer outcome prediction errors.
 """
 
 import numpy as np
-from typing import Dict, Any, Optional
+from sklearn.model_selection import KFold
+from typing import Dict, Any, Optional, Tuple
+import optuna
+
 from .tree import DivergenceTree
 
 
-# --------------------------- Basic effects (unchanged) ---------------------------
-
-
-def _estimate_effects_simple(T, YF, YC, idx):
-    """Diff-in-means estimates for firm (YF) and consumer (YC among converters)."""
-    sub_T, sub_YF, sub_YC = T[idx], YF[idx], YC[idx]
-    treated = sub_T == 1
-    control = ~treated
-    if treated.sum() == 0 or control.sum() == 0:
-        return np.nan, np.nan, idx.size
-
-    # Firm-side TE (Bernoulli conversion)
-    tauF = sub_YF[treated].mean() - sub_YF[control].mean()
-
-    # Consumer-side TE among converters in each arm
-    conv_treat = treated & (sub_YF == 1)
-    conv_ctrl = control & (sub_YF == 1)
-    if conv_treat.sum() == 0 or conv_ctrl.sum() == 0:
-        tauC = np.nan
-    else:
-        yC1 = sub_YC[conv_treat]
-        yC1 = yC1[np.isfinite(yC1)]
-        yC0 = sub_YC[conv_ctrl]
-        yC0 = yC0[np.isfinite(yC0)]
-        tauC = (yC1.mean() - yC0.mean()) if (yC1.size > 0 and yC0.size > 0) else np.nan
-    return tauF, tauC, idx.size
-
-
-# --------------------------- Validation SEs (standardization) ---------------------------
-
-
-def _leaf_se_F_bernoulli(T, YF, idx) -> float:
-    """
-    SE for diff-in-means of YF (Bernoulli):
-      SE^2 = p1(1-p1)/n1 + p0(1-p0)/n0
-    """
-    sub_T, sub_YF = T[idx], YF[idx]
-    treated = sub_T == 1
-    control = ~treated
-    n1, n0 = int(treated.sum()), int(control.sum())
-    if n1 == 0 or n0 == 0:
-        return np.nan
-    p1 = float(sub_YF[treated].mean())
-    p0 = float(sub_YF[control].mean())
-    var1 = p1 * (1 - p1)
-    var0 = p0 * (1 - p0)
-    se2 = var1 / max(n1, 1) + var0 / max(n0, 1)
-    return float(np.sqrt(max(se2, 1e-8)))
-
-
-def _leaf_se_C_generic(T, YF, YC, idx) -> float:
-    """
-    SE for diff-in-means of YC among converters:
-      SE^2 = Var(YC|T=1, YF=1)/c1 + Var(YC|T=0, YF=1)/c0
-    """
-    sub_T, sub_YF, sub_YC = T[idx], YF[idx], YC[idx]
-    treated = sub_T == 1
-    control = ~treated
-    conv_treat = treated & (sub_YF == 1)
-    conv_ctrl = control & (sub_YF == 1)
-    c1, c0 = int(conv_treat.sum()), int(conv_ctrl.sum())
-    if c1 == 0 or c0 == 0:
-        return np.nan
-    v1 = float(np.var(sub_YC[conv_treat], ddof=1)) if c1 > 1 else 0.0
-    v0 = float(np.var(sub_YC[conv_ctrl], ddof=1)) if c0 > 1 else 0.0
-    se2 = (v1 / max(c1, 1)) + (v0 / max(c0, 1))
-    return float(np.sqrt(max(se2, 1e-8)))
-
-
-# --------------------------- Standardized validation loss ---------------------------
-
-
-def evaluate_tree_consistency(
-    tree: DivergenceTree,
-    X_val: np.ndarray,
-    T_val: np.ndarray,
-    YF_val: np.ndarray,
-    YC_val: np.ndarray,
-    nan_penalty: float = 1.0,
-    weight_by: str = "val",  # "val" or "both"
+def pseudo_outcome_cv_loss(
+    X: np.ndarray,
+    T: np.ndarray,
+    YF: np.ndarray,
+    YC: np.ndarray,
+    params: Dict[str, Any],
+    n_splits: int = 5,
+    random_state: Optional[int] = 123,
 ) -> float:
     """
-    Standardized stability loss across leaves (lower is better):
+    Compute K-fold cross-validated pseudo-outcome MSE loss.
 
-      sum_leaves w * [ ((tauF_val - tauF_train)/SE_F_val)^2
-                     + ((tauC_val - tauC_train)/SE_C_val)^2 ]
+    Uses the pseudo-outcome approach from Wager & Athey (2018) to evaluate
+    treatment effect predictions. The loss combines firm and consumer outcome
+    prediction errors. YC is only observed for subscribers (YF == 1), so
+    non-subscribers are masked out of the consumer-outcome loss.
 
-    If a leaf's validation TE or SE is undefined, we add w * nan_penalty.
+    Parameters
+    ----------
+    X : np.ndarray of shape (n_samples, n_features)
+        Feature matrix.
+    T : np.ndarray of shape (n_samples,)
+        Treatment indicator (0 or 1).
+    YF : np.ndarray of shape (n_samples,)
+        Firm outcome (binary, observed for all units).
+    YC : np.ndarray of shape (n_samples,)
+        Consumer outcome (continuous, NaN where YF == 0).
+    params : dict
+        Hyperparameters for DivergenceTree.
+    n_splits : int, default=5
+        Number of folds for cross-validation.
+    random_state : int, optional
+        Random seed for KFold shuffling.
+
+    Returns
+    -------
+    float
+        Mean cross-validated pseudo-outcome MSE loss across all folds.
     """
-    leaves_val = tree.predict_leaf(X_val)
-    uniq_leaves = list({id(l): l for l in leaves_val}.values())
-
-    n_val_total = X_val.shape[0]
-    n_tr_total = sum(int(l.n or 0) for l in uniq_leaves)
-
-    loss = 0.0
-    for leaf in uniq_leaves:
-        m_val = np.array([l is leaf for l in leaves_val])
-        n_val_leaf = int(m_val.sum())
-        if n_val_leaf == 0:
-            continue
-
-        idx_val = np.where(m_val)[0]
-        tF_val, tC_val, _ = _estimate_effects_simple(T_val, YF_val, YC_val, idx_val)
-        tF_tr = leaf.tauF
-        tC_tr = leaf.tauC
-
-        # leaf weight
-        if weight_by == "val":
-            w = n_val_leaf / max(1, n_val_total)
-        else:  # "both"
-            w = (int(leaf.n or 0) + n_val_leaf) / max(1, n_tr_total + n_val_total)
-
-        # validation SEs for standardization
-        seF = _leaf_se_F_bernoulli(T_val, YF_val, idx_val)
-        seC = _leaf_se_C_generic(T_val, YF_val, YC_val, idx_val)
-
-        ok = (
-            np.isfinite(tF_val)
-            and np.isfinite(tC_val)
-            and np.isfinite(tF_tr)
-            and np.isfinite(tC_tr)
-            and np.isfinite(seF)
-            and np.isfinite(seC)
-            and seF > 0
-            and seC > 0
+    # Input validation
+    n = X.shape[0]
+    if len(T) != n or len(YF) != n or len(YC) != n:
+        raise ValueError(
+            f"Input arrays must have matching lengths: "
+            f"X={n}, T={len(T)}, YF={len(YF)}, YC={len(YC)}"
         )
-        if not ok:
-            loss += w * float(nan_penalty)
+
+    kf = KFold(n_splits=n_splits, shuffle=True, random_state=random_state)
+    losses = []
+
+    mask_C = ~np.isnan(YC)
+    T_F = (2 * T - 1) * YF
+    T_C = (2 * T - 1) * np.nan_to_num(YC, nan=0.0)
+
+    for train_idx, val_idx in kf.split(X):
+        X_train, X_val = X[train_idx], X[val_idx]
+        T_train, T_val = T[train_idx], T[val_idx]
+        YF_train, YF_val = YF[train_idx], YF[val_idx]
+        YC_train, YC_val = YC[train_idx], YC[val_idx]
+
+        try:
+            tree = DivergenceTree(**params)
+            tree.fit(X_train, T_train, YF_train, YC_train)
+
+            leaves_val = tree.predict_leaf(X_val)
+            tauF_hat = np.nan_to_num([leaf.tauF for leaf in leaves_val], nan=0.0)
+            tauC_hat = np.nan_to_num([leaf.tauC for leaf in leaves_val], nan=0.0)
+        except Exception:
+            # If tree fitting fails, return a large loss
+            losses.append(1e6)
             continue
 
-        zF = (float(tF_val) - float(tF_tr)) / max(seF, 1e-8)
-        zC = (float(tC_val) - float(tC_tr)) / max(seC, 1e-8)
-        loss += w * (zF**2 + zC**2)
+        # firm outcome loss (all)
+        err_F = (T_F[val_idx] - 0.5 * tauF_hat) ** 2
+        firm_loss = np.mean(err_F)
 
-    return float(loss)
+        # consumer outcome loss (only subscribers)
+        valid_mask = mask_C[val_idx]
+        if np.any(valid_mask):
+            err_C = (T_C[val_idx][valid_mask] - 0.5 * tauC_hat[valid_mask]) ** 2
+            consumer_loss = np.mean(err_C)
+            fold_loss = firm_loss + consumer_loss
+        else:
+            fold_loss = firm_loss
+
+        losses.append(fold_loss)
+
+    return float(np.mean(losses))
 
 
-# --------------------------- Optuna tuning (stump penalty only) ---------------------------
-
-
-def tune_with_optuna_partial(
+def tune_with_optuna(
     X: np.ndarray,
     T: np.ndarray,
     YF: np.ndarray,
     YC: np.ndarray,
     fixed: Optional[Dict[str, Any]] = None,
     search_space: Optional[Dict[str, Dict[str, Any]]] = None,
-    valid_fraction: float = 0.25,
     n_trials: int = 50,
-    random_state: Optional[int] = 123,  # reproducibility only
-):
-    import optuna
+    n_splits: int = 5,
+    random_state: Optional[int] = 123,
+) -> Tuple[Dict[str, Any], float]:
+    """
+    Hyperparameter tuning using Optuna with K-fold CV pseudo-outcome loss.
 
+    Tunes `max_partitions` and `min_improvement_ratio` by default. If a
+    search_space is provided, it will be used instead of the defaults.
+
+    Parameters
+    ----------
+    X : np.ndarray of shape (n_samples, n_features)
+        Feature matrix.
+    T : np.ndarray of shape (n_samples,)
+        Treatment indicator (0 or 1).
+    YF : np.ndarray of shape (n_samples,)
+        Firm outcome (binary, observed for all units).
+    YC : np.ndarray of shape (n_samples,)
+        Consumer outcome (continuous, NaN where YF == 0).
+    fixed : dict, optional
+        Fixed hyperparameters for DivergenceTree. These will be
+        used in all trials. Common examples: lambda_, n_quantiles, co_movement.
+    search_space : dict, optional
+        Custom search space specification. If None, defaults to tuning
+        max_partitions (2-20) and min_improvement_ratio (0.001-0.1, log scale).
+        Format: {"param_name": {"low": value, "high": value, "log": bool}}
+    n_trials : int, default=50
+        Number of Optuna optimization trials.
+    n_splits : int, default=5
+        Number of folds for cross-validation.
+    random_state : int, optional
+        Random seed for reproducibility (KFold and Optuna sampler).
+
+    Returns
+    -------
+    best_params : dict
+        Best hyperparameters found (combines fixed and tuned parameters).
+    best_loss : float
+        Best cross-validated pseudo-outcome MSE loss achieved.
+
+    Raises
+    ------
+    RuntimeError
+        If Optuna study fails to complete any successful trials.
+    """
     fixed = dict(fixed or {})
-    search_space = dict(search_space or {})
+    search_space = dict(search_space or {}) if search_space is not None else {}
 
-    # --- guard: never allow random_state in search space ---
-    if "random_state" in search_space:
-        raise ValueError("Do not include 'random_state' in search_space.")
+    # Default search space for the two main hyperparameters
+    if "max_partitions" not in search_space and "max_partitions" not in fixed:
+        search_space["max_partitions"] = {"low": 2, "high": 20}
+    if (
+        "min_improvement_ratio" not in search_space
+        and "min_improvement_ratio" not in fixed
+    ):
+        search_space["min_improvement_ratio"] = {"low": 0.001, "high": 0.1, "log": True}
 
-    # --- split (reproducible, not tunable) ---
-    rng = np.random.default_rng(random_state)
-    n = X.shape[0]
-    idx = np.arange(n)
-    rng.shuffle(idx)
-    cut = int(n * (1 - valid_fraction))
-    train_idx, val_idx = idx[:cut], idx[cut:]
-
-    X_tr, X_val = X[train_idx], X[val_idx]
-    T_tr, T_val = T[train_idx], T[val_idx]
-    YF_tr, YF_val = YF[train_idx], YF[val_idx]
-    YC_tr, YC_val = YC[train_idx], YC[val_idx]
-
-    def suggest_params(trial):
-        """
-        Build params from search_space. Supports:
-          - {"type":"float","low":a,"high":b,"log":True/False}
-          - {"type":"int","low":a,"high":b,"step":k}
-          - {"type":"cat","choices":[...]}
-        """
+    def objective(trial):
         params = dict(fixed)
+
+        # Suggest hyperparameters from search space
         for name, spec in search_space.items():
-            t = spec["type"]
-            if t == "float":
-                if spec.get("log", False):
-                    params[name] = trial.suggest_float(
-                        name, spec["low"], spec["high"], log=True
-                    )
-                else:
-                    params[name] = trial.suggest_float(name, spec["low"], spec["high"])
-            elif t == "int":
+            if name in fixed:
+                continue  # Skip if already in fixed params
+
+            if "log" in spec and spec["log"]:
+                params[name] = trial.suggest_float(
+                    name, spec["low"], spec["high"], log=True
+                )
+            elif isinstance(spec["low"], float) or isinstance(spec["high"], float):
+                params[name] = trial.suggest_float(name, spec["low"], spec["high"])
+            else:
                 step = spec.get("step", 1)
                 params[name] = trial.suggest_int(
                     name, spec["low"], spec["high"], step=step
                 )
-            elif t == "cat":
-                params[name] = trial.suggest_categorical(name, spec["choices"])
-            else:
-                raise ValueError(f"Unknown type in search_space for {name}: {t}")
-        return params
 
-    def objective(trial):
-        params = suggest_params(trial)
-        tree = DivergenceTree(
-            random_state=fixed.get("random_state", random_state),
-            **{k: v for k, v in params.items() if k != "random_state"},
+        loss = pseudo_outcome_cv_loss(
+            X, T, YF, YC, params, n_splits=n_splits, random_state=random_state
         )
-        try:
-            tree.fit(X_tr, T_tr, YF_tr, YC_tr)
-
-            # Standardized consistency loss (lower is better)
-            loss = evaluate_tree_consistency(
-                tree,
-                X_val,
-                T_val,
-                YF_val,
-                YC_val,
-                nan_penalty=1.0,
-                weight_by="val",  # or "both"
-            )
-
-            return loss if np.isfinite(loss) else 1e6
-
-        except Exception:
-            # Any failure → large loss so Optuna moves on
-            return 1e6
+        return loss if np.isfinite(loss) else 1e6
 
     sampler = optuna.samplers.TPESampler(seed=random_state)
     study = optuna.create_study(direction="minimize", sampler=sampler)
     study.optimize(objective, n_trials=n_trials, show_progress_bar=False)
 
+    # Check if any trials completed successfully
+    if len(study.trials) == 0 or study.best_trial is None:
+        raise RuntimeError(
+            "No successful trials completed. Check that tree fitting "
+            "succeeds with the provided parameters."
+        )
+
     tuned = {k: v for k, v in study.best_trial.params.items() if k != "random_state"}
     best_params = dict(fixed)
     best_params.update(tuned)
-    best_loss = study.best_value  # lower is better
+    best_loss = study.best_value
+
     return best_params, best_loss
