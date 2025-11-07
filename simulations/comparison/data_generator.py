@@ -1,11 +1,12 @@
 """
-Data Generator for Comparison Simulation
+Data Generator for Comparison Simulation (Continuous Outcomes)
 
 Generates synthetic data with:
 - N users with F features (uniformly distributed 0-10)
 - Random 50/50 treatment assignment
-- Firm outcome (binary) with treatment effects based on X1, X2
+- Firm outcome (continuous) with treatment effects based on X1, X2
 - User outcome (continuous) with treatment effects based on X1, X2
+- Both outcomes are always observed (no NaN values)
 - Specific treatment effect structure as specified
 """
 
@@ -16,19 +17,25 @@ from typing import Tuple, Dict, Any, Optional
 def generate_comparison_data(
     n_users: int = 10000,
     n_features: int = 10,
-    base_subscription_prob: float = 0.5,
+    firm_outcome_base: float = 0.0,
+    firm_outcome_noise_std: float = 1.0,
+    user_outcome_base: float = 0.0,
     user_outcome_noise_std: float = 1.0,
     random_seed: Optional[int] = None,
-    firm_effect_strength: float = 0.2,
+    firm_effect_strength: float = 1,
     user_effect_strength: float = 2.0,
-) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+) -> Tuple[
+    np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray
+]:
     """
-    Generate synthetic data for comparison simulation.
+    Generate synthetic data for comparison simulation with continuous outcomes.
 
     Args:
         n_users: Number of users to generate
         n_features: Number of features per user (must be >= 4)
-        base_subscription_prob: Base probability of subscription (without treatment)
+        firm_outcome_base: Base value for firm outcome (without treatment)
+        firm_outcome_noise_std: Standard deviation of firm outcome noise
+        user_outcome_base: Base value for user outcome (without treatment)
         user_outcome_noise_std: Standard deviation of user outcome noise
         random_seed: Random seed for reproducibility
         firm_effect_strength: Direct strength of firm treatment effects (default 0.2)
@@ -37,10 +44,12 @@ def generate_comparison_data(
     Returns:
         X: Feature matrix (n_users, n_features)
         T: Treatment assignment (n_users,) - binary 0/1
-        YF: Firm outcome (n_users,) - binary 0/1 (subscription)
-        YC: User outcome (n_users,) - continuous, NaN where YF=0
+        YF: Firm outcome (n_users,) - continuous, always observed
+        YC: User outcome (n_users,) - continuous, always observed
         tauF: Firm treatment effects (n_users,)
         tauC: User treatment effects (n_users,)
+        region_type: Region type (n_users,) - 1: both positive, 2: firm+ customer-,
+                    3: firm- customer+, 4: both negative
     """
 
     if n_features < 4:
@@ -59,24 +68,33 @@ def generate_comparison_data(
     tauF = calculate_firm_treatment_effects(X, firm_effect_strength)
     tauC = calculate_user_treatment_effects(X, user_effect_strength)
 
-    # Generate firm outcomes (subscription)
-    # Base probability + treatment effect (only for treated users)
+    # Generate firm outcomes (continuous)
+    # Base value + treatment effect (only for treated users) + noise
     firm_treatment_effect = tauF * T
-    subscription_prob = np.clip(
-        base_subscription_prob + firm_treatment_effect, 0.01, 0.99
-    )
-    YF = rng.binomial(1, subscription_prob, size=n_users)
+    firm_outcome_noise = rng.normal(0, firm_outcome_noise_std, size=n_users)
+    YF = firm_outcome_base + firm_treatment_effect + firm_outcome_noise
 
     # Generate user outcomes (continuous)
-    # Mean = 0 + treatment effect (only for treated users) + noise
+    # Base value + treatment effect (only for treated users) + noise
     user_treatment_effect = tauC * T
     user_outcome_noise = rng.normal(0, user_outcome_noise_std, size=n_users)
-    YC_raw = user_treatment_effect + user_outcome_noise
+    YC = user_outcome_base + user_treatment_effect + user_outcome_noise
 
-    # Set YC to NaN where YF=0 (non-subscribers)
-    YC = np.where(YF == 1, YC_raw, np.nan)
+    # Compute region type based on signs of treatment effects
+    # 1: both positive, 2: firm+ customer-, 3: firm- customer+, 4: both negative
+    region_type = np.zeros(n_users, dtype=int)
+    both_positive = (tauF > 0) & (tauC > 0)
+    firm_pos_cust_neg = (tauF > 0) & (tauC <= 0)
+    firm_neg_cust_pos = (tauF <= 0) & (tauC > 0)
+    both_negative = (tauF <= 0) & (tauC <= 0)
 
-    return X, T, YF, YC, tauF, tauC
+    region_type[both_positive] = 1
+    region_type[firm_pos_cust_neg] = 2
+    region_type[firm_neg_cust_pos] = 3
+    region_type[both_negative] = 4
+
+    # Both outcomes are always observed (no NaN values)
+    return X, T, YF, YC, tauF, tauC, region_type
 
 
 def calculate_firm_treatment_effects(
@@ -180,8 +198,8 @@ def get_data_summary(
     Args:
         X: Feature matrix
         T: Treatment assignment
-        YF: Firm outcome
-        YC: User outcome
+        YF: Firm outcome (continuous)
+        YC: User outcome (continuous)
 
     Returns:
         Dictionary with summary statistics
@@ -191,13 +209,17 @@ def get_data_summary(
     n_control = n_users - n_treated
 
     # Firm outcome statistics
-    firm_treated_rate = YF[T == 1].mean() if n_treated > 0 else 0
-    firm_control_rate = YF[T == 0].mean() if n_control > 0 else 0
-    firm_ate = firm_treated_rate - firm_control_rate
+    firm_treated_mean = YF[T == 1].mean() if n_treated > 0 else np.nan
+    firm_control_mean = YF[T == 0].mean() if n_control > 0 else np.nan
+    firm_ate = (
+        firm_treated_mean - firm_control_mean
+        if not (np.isnan(firm_treated_mean) or np.isnan(firm_control_mean))
+        else np.nan
+    )
 
-    # User outcome statistics (only for subscribers)
-    user_treated_mean = np.nanmean(YC[T == 1]) if n_treated > 0 else np.nan
-    user_control_mean = np.nanmean(YC[T == 0]) if n_control > 0 else np.nan
+    # User outcome statistics
+    user_treated_mean = YC[T == 1].mean() if n_treated > 0 else np.nan
+    user_control_mean = YC[T == 0].mean() if n_control > 0 else np.nan
     user_ate = (
         user_treated_mean - user_control_mean
         if not (np.isnan(user_treated_mean) or np.isnan(user_control_mean))
@@ -209,32 +231,42 @@ def get_data_summary(
         "n_treated": n_treated,
         "n_control": n_control,
         "treatment_rate": n_treated / n_users,
-        "firm_treated_rate": firm_treated_rate,
-        "firm_control_rate": firm_control_rate,
+        "firm_treated_mean": firm_treated_mean,
+        "firm_control_mean": firm_control_mean,
         "firm_ate": firm_ate,
+        "firm_std": YF.std(),
         "user_treated_mean": user_treated_mean,
         "user_control_mean": user_control_mean,
         "user_ate": user_ate,
-        "subscription_rate": YF.mean(),
-        "conversion_rate": np.nanmean(YC[YF == 1]) if YF.sum() > 0 else np.nan,
+        "user_std": YC.std(),
     }
 
 
 if __name__ == "__main__":
     # Example usage
-    print("Generating comparison data...")
+    print("Generating comparison data with continuous outcomes...")
 
-    X, T, YF, YC = generate_comparison_data(
+    X, T, YF, YC, tauF, tauC, region_type = generate_comparison_data(
         n_users=10000,
         n_features=10,
-        base_subscription_prob=0.5,
-        user_outcome_std=1.0,
+        firm_outcome_base=0.0,
+        firm_outcome_noise_std=1.0,
+        user_outcome_base=0.0,
+        user_outcome_noise_std=1.0,
         random_seed=42,
     )
 
     print(
         f"Generated data shape: X={X.shape}, T={T.shape}, YF={YF.shape}, YC={YC.shape}"
     )
+    print(f"YF has NaN: {np.isnan(YF).any()}")
+    print(f"YC has NaN: {np.isnan(YC).any()}")
+    print(f"\nRegion type distribution:")
+    for rt in [1, 2, 3, 4]:
+        count = (region_type == rt).sum()
+        print(
+            f"  Region {rt}: {count} observations ({100*count/len(region_type):.2f}%)"
+        )
 
     # Get summary statistics
     summary = get_data_summary(X, T, YF, YC)

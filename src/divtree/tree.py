@@ -3,8 +3,11 @@ Divergence Tree for two outcomes using recursive partitioning.
 
 This implementation grows a tree by recursively partitioning the feature space
 to identify regions with heterogeneous treatment effects on two outcomes:
-- YF: firm outcome (binary; e.g., subscription), observed for all units
-- YC: consumer outcome (continuous; observed only when YF == 1, otherwise NaN)
+- YF: firm outcome (binary or continuous), may contain NaN for missing values
+- YC: consumer outcome (binary or continuous), may contain NaN for missing values
+
+The algorithm automatically detects whether each outcome is binary (0/1 only)
+or continuous, and handles NaN values as general missing data indicators.
 
 The algorithm:
 1. Grows a maximal tree up to max_partitions leaves using global split selection
@@ -74,7 +77,9 @@ class DivergenceTree:
 
     This class implements a recursive partitioning algorithm that identifies
     regions with heterogeneous treatment effects on firm (YF) and consumer (YC)
-    outcomes. The tree grows maximally to max_partitions leaves, then prunes
+    outcomes. The algorithm automatically detects whether each outcome is binary
+    (0/1 only) or continuous, and handles NaN values as general missing data
+    indicators. The tree grows maximally to max_partitions leaves, then prunes
     splits with improvement_ratio below min_improvement_ratio.
 
     Parameters
@@ -132,6 +137,34 @@ class DivergenceTree:
         self.root_: Optional[TreeNode] = None
         self._fit_data: Dict[str, Any] = {}
         self._root_baseline: Dict[str, float] = {}
+        self._outcome_type_F: Optional[str] = None  # 'binary' or 'continuous'
+        self._outcome_type_C: Optional[str] = None  # 'binary' or 'continuous'
+
+    # ---------------- Outcome Type Detection ----------------
+
+    def _detect_outcome_type(self, y: np.ndarray) -> str:
+        """
+        Detect if outcome is binary (0/1 only) or continuous.
+
+        Parameters
+        ----------
+        y : np.ndarray
+            Outcome array (may contain NaN values).
+
+        Returns
+        -------
+        str
+            'binary' if outcome contains only 0 and 1, 'continuous' otherwise.
+        """
+        # Remove NaN values for detection
+        y_clean = y[~np.isnan(y)]
+        if len(y_clean) == 0:
+            return "continuous"  # Default if all NaN
+        unique_vals = np.unique(y_clean)
+        # Check if only contains 0 and 1
+        if len(unique_vals) <= 2 and np.all(np.isin(unique_vals, [0, 1])):
+            return "binary"
+        return "continuous"
 
     # ---------------- Public API ----------------
 
@@ -148,9 +181,9 @@ class DivergenceTree:
         T : np.ndarray of shape (n_samples,)
             Treatment indicator (0 or 1).
         YF : np.ndarray of shape (n_samples,)
-            Firm outcome (binary, observed for all units).
+            Firm outcome (binary or continuous). NaN values indicate missing data.
         YC : np.ndarray of shape (n_samples,)
-            Consumer outcome (continuous, NaN where YF == 0).
+            Consumer outcome (binary or continuous). NaN values indicate missing data.
 
         Returns
         -------
@@ -160,9 +193,8 @@ class DivergenceTree:
         Raises
         ------
         ValueError
-            If T contains values other than 0 or 1, or if YC is not NaN
-            where YF == 0, or if YC is not finite where YF == 1, or if
-            input arrays have mismatched lengths.
+            If T contains values other than 0 or 1, if input arrays have
+            mismatched lengths, or if YF or YC do not contain numeric values.
         """
         X, T, YF, YC = map(np.asarray, (X, T, YF, YC))
 
@@ -176,12 +208,20 @@ class DivergenceTree:
 
         if not np.all(np.isin(T, [0, 1])):
             raise ValueError("T must be in {0,1}.")
-        non_conv_mask = YF == 0
-        if not np.all(np.isnan(YC[non_conv_mask])):
-            raise ValueError("YC must be NaN where YF == 0 (non-converters).")
-        conv_mask = YF == 1
-        if not np.all(np.isfinite(YC[conv_mask])):
-            raise ValueError("YC must be finite where YF == 1 (converters).")
+
+        # Validate that YF and YC contain numeric values (allow NaN)
+        if not (
+            np.issubdtype(YF.dtype, np.number) or np.issubdtype(YF.dtype, np.bool_)
+        ):
+            raise ValueError("YF must contain numeric values.")
+        if not (
+            np.issubdtype(YC.dtype, np.number) or np.issubdtype(YC.dtype, np.bool_)
+        ):
+            raise ValueError("YC must contain numeric values.")
+
+        # Detect outcome types
+        self._outcome_type_F = self._detect_outcome_type(YF)
+        self._outcome_type_C = self._detect_outcome_type(YC)
 
         all_idx = np.arange(n)
 
@@ -196,12 +236,12 @@ class DivergenceTree:
 
         # Initialize root node
         self.root_ = TreeNode(depth=0, indices=all_idx)
-        tauF, tauC, n_leaf, nt, nc = self._estimate_effects(all_idx)
+        tauF, tauC, n_leaf, _, _, nt, nc = self._estimate_effects(all_idx)
         self.root_.tauF, self.root_.tauC = tauF, tauC
         self.root_.n, self.root_.n_treated, self.root_.n_control = n_leaf, nt, nc
 
         # Compute root baseline for 'global' baseline mode
-        root_tauF, root_tauC, _, _, _ = self._estimate_effects(all_idx)
+        root_tauF, root_tauC, _, _, _, _, _ = self._estimate_effects(all_idx)
         root_sF, root_sC = self._compute_scales(all_idx)
         self._root_baseline = dict(
             tauF=root_tauF,
@@ -242,6 +282,87 @@ class DivergenceTree:
             return descend(x, node.right)
 
         return np.array([descend(x, self.root_) for x in X], dtype=object)
+
+    def predict_region_type(self, X: np.ndarray) -> np.ndarray:
+        """
+        Predict region types for new observations based on treatment effects.
+
+        Region types are determined by the signs of predicted treatment effects:
+        - Region 1: tauF > 0 and tauC > 0 (both positive)
+        - Region 2: tauF > 0 and tauC <= 0 (firm positive, customer negative)
+        - Region 3: tauF <= 0 and tauC > 0 (firm negative, customer positive)
+        - Region 4: tauF <= 0 and tauC <= 0 (both negative)
+
+        Parameters
+        ----------
+        X : np.ndarray of shape (n_samples, n_features)
+            Feature matrix.
+
+        Returns
+        -------
+        np.ndarray of shape (n_samples,)
+            Predicted region type labels (1-4).
+        """
+        if self.root_ is None:
+            raise ValueError("Model has not been fitted. Call fit() first.")
+
+        X = np.asarray(X)
+
+        # Get leaf nodes for each observation
+        leaves_val = self.predict_leaf(X)
+
+        # Extract treatment effects from leaves
+        tauF_pred = np.array(
+            [leaf.tauF if leaf.tauF is not None else 0.0 for leaf in leaves_val]
+        )
+        tauC_pred = np.array(
+            [leaf.tauC if leaf.tauC is not None else 0.0 for leaf in leaves_val]
+        )
+
+        # Categorize into region types
+        return self._categorize_region_types(tauF_pred, tauC_pred)
+
+    def _categorize_region_types(
+        self, tauF: np.ndarray, tauC: np.ndarray
+    ) -> np.ndarray:
+        """
+        Categorize observations into 4 region types based on treatment effect signs.
+
+        Parameters
+        ----------
+        tauF : np.ndarray
+            Treatment effects for firm outcome.
+        tauC : np.ndarray
+            Treatment effects for consumer outcome.
+
+        Returns
+        -------
+        np.ndarray
+            Region type labels (1-4).
+        """
+        region_types = np.zeros(len(tauF), dtype=int)
+
+        # Handle NaN values by treating them as 0
+        tauF_clean = np.nan_to_num(tauF, nan=0.0)
+        tauC_clean = np.nan_to_num(tauC, nan=0.0)
+
+        # Region 1: both positive
+        mask1 = (tauF_clean > 0) & (tauC_clean > 0)
+        region_types[mask1] = 1
+
+        # Region 2: firm positive, customer negative
+        mask2 = (tauF_clean > 0) & (tauC_clean <= 0)
+        region_types[mask2] = 2
+
+        # Region 3: firm negative, customer positive
+        mask3 = (tauF_clean <= 0) & (tauC_clean > 0)
+        region_types[mask3] = 3
+
+        # Region 4: both negative
+        mask4 = (tauF_clean <= 0) & (tauC_clean <= 0)
+        region_types[mask4] = 4
+
+        return region_types
 
     def leaf_effects(self) -> Dict[str, Any]:
         """
@@ -400,7 +521,7 @@ class DivergenceTree:
             (leaf.left, leaf.indices[left_mask]),
             (leaf.right, leaf.indices[right_mask]),
         ]:
-            tauF, tauC, n, nt, nc = self._estimate_effects(child_indices)
+            tauF, tauC, n, _, _, nt, nc = self._estimate_effects(child_indices)
             child.tauF, child.tauC = tauF, tauC
             child.n, child.n_treated, child.n_control = n, nt, nc
 
@@ -449,8 +570,8 @@ class DivergenceTree:
         # Compute child effects
         indices_L = indices[left_mask]
         indices_R = indices[right_mask]
-        tauF_L, tauC_L, nL, _, _ = self._estimate_effects(indices_L)
-        tauF_R, tauC_R, nR, _, _ = self._estimate_effects(indices_R)
+        tauF_L, tauC_L, nL, _, _, _, _ = self._estimate_effects(indices_L)
+        tauF_R, tauC_R, nR, _, _, _, _ = self._estimate_effects(indices_R)
         if not all(map(np.isfinite, [tauF_L, tauC_L, tauF_R, tauC_R])):
             return None
 
@@ -639,7 +760,7 @@ class DivergenceTree:
     def _prune_node_to_leaf(self, node: TreeNode):
         """Prune a node to a leaf by removing its children."""
         # Recompute leaf estimates using all data in this node
-        tauF, tauC, n, nt, nc = self._estimate_effects(node.indices)
+        tauF, tauC, n, _, _, nt, nc = self._estimate_effects(node.indices)
         node.tauF, node.tauC = tauF, tauC
         node.n, node.n_treated, node.n_control = n, nt, nc
 
@@ -714,6 +835,53 @@ class DivergenceTree:
             "sC": sC,
         }
 
+    def _compute_variance_for_outcome(
+        self,
+        y: np.ndarray,
+        outcome_type: str,
+        treated: np.ndarray,
+        control: np.ndarray,
+    ) -> float:
+        """
+        Compute variance for a single outcome using type-aware computation.
+
+        Parameters
+        ----------
+        y : np.ndarray
+            Outcome array (may contain NaN).
+        outcome_type : str
+            'binary' or 'continuous'.
+        treated : np.ndarray
+            Boolean mask for treated group.
+        control : np.ndarray
+            Boolean mask for control group.
+
+        Returns
+        -------
+        float
+            Variance of the treatment effect estimate.
+        """
+        y_treated_clean = y[treated & ~np.isnan(y)]
+        y_control_clean = y[control & ~np.isnan(y)]
+        n1_clean = len(y_treated_clean)
+        n0_clean = len(y_control_clean)
+
+        if outcome_type == "binary":
+            # Binary: Bernoulli variance p(1-p)
+            p1 = np.nanmean(y_treated_clean) if n1_clean > 0 else 0.0
+            p0 = np.nanmean(y_control_clean) if n0_clean > 0 else 0.0
+            var1 = p1 * (1 - p1) if n1_clean > 0 else 0.0
+            var0 = p0 * (1 - p0) if n0_clean > 0 else 0.0
+        else:
+            # Continuous: sample variance
+            var1 = np.nanvar(y_treated_clean, ddof=1) if n1_clean > 1 else 0.0
+            var0 = np.nanvar(y_control_clean, ddof=1) if n0_clean > 1 else 0.0
+
+        variance = max(
+            var1 / max(n1_clean, 1) + var0 / max(n0_clean, 1), self.eps_scale
+        )
+        return variance
+
     def _compute_scales(self, idx: np.ndarray) -> Tuple[float, float]:
         """
         Compute standard errors for difference-in-means treatment effect estimates.
@@ -721,6 +889,20 @@ class DivergenceTree:
         The scales normalize the objective function so firm and consumer effects
         contribute comparably. For tau = mean(Y|T=1) - mean(Y|T=0):
         Var(tau) = Var(Y|T=1)/n1 + Var(Y|T=0)/n0, SE(tau) = sqrt(Var(tau))
+
+        Automatically handles binary and continuous outcomes:
+        - Binary: uses Bernoulli variance p(1-p)
+        - Continuous: uses sample variance
+
+        Parameters
+        ----------
+        idx : np.ndarray
+            Indices of data points to use for scale computation.
+
+        Returns
+        -------
+        Tuple[float, float]
+            (sF, sC) standard errors for firm and consumer outcomes.
         """
         T, YF, YC = (
             self._fit_data["T"],
@@ -729,54 +911,94 @@ class DivergenceTree:
         )
         sub_T, sub_YF, sub_YC = T[idx], YF[idx], YC[idx]
         treated, control = (sub_T == 1), (sub_T == 0)
-        n1, n0 = treated.sum(), control.sum()
 
-        # Firm outcome: binary (Bernoulli) variance p(1-p)
-        # Var(tauF) = p1(1-p1)/n1 + p0(1-p0)/n0
-        p1 = sub_YF[treated].mean() if n1 > 0 else 0.0
-        p0 = sub_YF[control].mean() if n0 > 0 else 0.0
-        var1 = p1 * (1 - p1) if n1 > 0 else 0.0
-        var0 = p0 * (1 - p0) if n0 > 0 else 0.0
-        sF2 = max(var1 / max(n1, 1) + var0 / max(n0, 1), self.eps_scale)
-
-        # Consumer outcome: continuous variance (only for converters, YF==1)
-        # Var(tauC) = Var(YC|T=1,YF=1)/c1 + Var(YC|T=0,YF=1)/c0
-        conv_treat = treated & (sub_YF == 1)
-        conv_ctrl = control & (sub_YF == 1)
-        c1, c0 = conv_treat.sum(), conv_ctrl.sum()
-        varC1 = np.var(sub_YC[conv_treat], ddof=1) if c1 > 1 else 0.0
-        varC0 = np.var(sub_YC[conv_ctrl], ddof=1) if c0 > 1 else 0.0
-        sC2 = max(varC1 / max(c1, 1) + varC0 / max(c0, 1), self.eps_scale)
+        # Compute variance for both outcomes using shared helper
+        sF2 = self._compute_variance_for_outcome(
+            sub_YF, self._outcome_type_F, treated, control
+        )
+        sC2 = self._compute_variance_for_outcome(
+            sub_YC, self._outcome_type_C, treated, control
+        )
 
         return float(np.sqrt(sF2)), float(np.sqrt(sC2))
 
-    def _estimate_effects(self, idx: np.ndarray) -> Tuple[float, float, int, int, int]:
-        """Estimate treatment effects using difference-in-means."""
+    def _compute_effect_for_outcome(
+        self,
+        y: np.ndarray,
+        treated: np.ndarray,
+        control: np.ndarray,
+    ) -> float:
+        """
+        Compute treatment effect for a single outcome using difference-in-means.
+
+        Parameters
+        ----------
+        y : np.ndarray
+            Outcome array (may contain NaN).
+        treated : np.ndarray
+            Boolean mask for treated group.
+        control : np.ndarray
+            Boolean mask for control group.
+
+        Returns
+        -------
+        float
+            Treatment effect (may be np.nan if insufficient data).
+        """
+        n1, n0 = treated.sum(), control.sum()
+        if n1 == 0 or n0 == 0:
+            return np.nan
+
+        # Filter NaN values for both treated and control
+        y_treated_clean = y[treated & ~np.isnan(y)]
+        y_control_clean = y[control & ~np.isnan(y)]
+        if len(y_treated_clean) == 0 or len(y_control_clean) == 0:
+            return np.nan
+
+        return float(np.nanmean(y_treated_clean) - np.nanmean(y_control_clean))
+
+    def _estimate_effects(
+        self, idx: np.ndarray
+    ) -> Tuple[float, float, int, int, int, int, int]:
+        """
+        Estimate treatment effects using difference-in-means.
+
+        Automatically handles binary and continuous outcomes, filtering NaN values.
+        For binary outcomes, computes difference in proportions.
+        For continuous outcomes, computes difference in means.
+
+        Parameters
+        ----------
+        idx : np.ndarray
+            Indices of data points to use for effect estimation.
+
+        Returns
+        -------
+        Tuple[float, float, int, int, int, int, int]
+            (tauF, tauC, n, nF, nC, n_treated, n_control)
+            tauF and tauC may be np.nan if insufficient data.
+            n: count of observations with at least one valid outcome (for gain calculation)
+            nF: count of observations with valid YF (non-NaN)
+            nC: count of observations with valid YC (non-NaN)
+        """
         T, YF, YC = (
             self._fit_data["T"],
             self._fit_data["YF"],
             self._fit_data["YC"],
         )
         sub_T, sub_YF, sub_YC = T[idx], YF[idx], YC[idx]
-        n = idx.size
         treated = sub_T == 1
         control = ~treated
         n1, n0 = treated.sum(), control.sum()
 
-        # Firm effect (binary outcome)
-        tauF = np.nan
-        if n1 > 0 and n0 > 0:
-            tauF = float(sub_YF[treated].mean() - sub_YF[control].mean())
+        # Compute effects for both outcomes using shared helper
+        tauF = self._compute_effect_for_outcome(sub_YF, treated, control)
+        tauC = self._compute_effect_for_outcome(sub_YC, treated, control)
 
-        # Consumer effect (only for converters)
-        conv_treat = treated & (sub_YF == 1)
-        conv_ctrl = control & (sub_YF == 1)
-        c1, c0 = conv_treat.sum(), conv_ctrl.sum()
-        tauC = np.nan
-        if c1 > 0 and c0 > 0:
-            yC1 = sub_YC[conv_treat]
-            yC0 = sub_YC[conv_ctrl]
-            if np.isfinite(yC1).any() and np.isfinite(yC0).any():
-                tauC = float(np.nanmean(yC1) - np.nanmean(yC0))
+        # Count valid observations separately for each outcome
+        nF = int((~np.isnan(sub_YF)).sum())  # Count for firm outcome
+        nC = int((~np.isnan(sub_YC)).sum())  # Count for consumer outcome
+        # For gain calculation, use count of observations with at least one valid outcome
+        n = int((~np.isnan(sub_YF) | ~np.isnan(sub_YC)).sum())
 
-        return tauF, tauC, int(n), int(n1), int(n0)
+        return tauF, tauC, int(n), int(nF), int(nC), int(n1), int(n0)

@@ -1,10 +1,14 @@
-# examples/simplest_simulate.py
+# examples/basic.py
 import numpy as np
 import matplotlib.pyplot as plt
-from divtree import DivergenceTree
-from divtree.viz import plot_divergence_tree
+import sys
+import os
 
-import pdb
+# Add the src directory to the path to import divtree
+sys.path.append(os.path.join(os.path.dirname(__file__), "..", "src"))
+from divtree.tree import DivergenceTree
+from divtree.tune import tune_with_optuna
+from divtree.viz import plot_divergence_tree
 
 
 def make_data(n=4000, seed=0, aF=0.1, aC=0.1):
@@ -44,49 +48,57 @@ def make_data(n=4000, seed=0, aF=0.1, aC=0.1):
 
 
 if __name__ == "__main__":
-    # pip install optuna  (first time)
-    from divtree.tune import tune_with_optuna_partial
-
     # --- simulate data (or your real data) ---
-    X, T, YF, YC = make_data(n=200000, seed=0, aF=0.20, aC=0.30)
+    X, T, YF, YC = make_data(n=20000, seed=0, aF=0.20, aC=0.30)
 
     # --- freeze what you want fixed ---
     fixed = {
-        "honest": True,
         "lambda_": 1,
         "n_quantiles": 50,
-        "min_leaf_treated": 1,
-        "min_leaf_control": 1,
-        "min_leaf_conv_treated": 1,
-        "min_leaf_conv_control": 1,
         "random_state": 0,  # for reproducibility
+        "co_movement": "both",
+        "eps_scale": 1e-8,
     }
 
     # --- tune only these two ---
     search_space = {
-        "max_depth": {"type": "int", "low": 2, "high": 6},
-        "min_leaf_n": {"type": "int", "low": 500, "high": 4000, "step": 250},
+        "max_partitions": {"low": 4, "high": 15},
+        "min_improvement_ratio": {"low": 0.001, "high": 0.05, "log": True},
     }
 
-    best_params, best_score = tune_with_optuna_partial(
+    print("Running hyperparameter optimization...")
+    best_params, best_loss = tune_with_optuna(
         X,
         T,
         YF,
         YC,
         fixed=fixed,
         search_space=search_space,
-        valid_fraction=0.2,
         n_trials=10,
-        random_state=123,
+        n_splits=2,
+        random_state=0,
     )
     print("Best params:", best_params)
-    print("Best validation score:", best_score)
+    print("Best CV loss:", best_loss)
 
     # --- fit final model on full data with best params ---
-    tree = DivergenceTree(**best_params).fit(X, T, YF, YC)
+    print("\nTraining final tree with best parameters...")
+    tree = DivergenceTree(**best_params)
+    tree.fit(X, T, YF, YC)
     print(f"Root: tauF={tree.root_.tauF:.4f}, tauC={tree.root_.tauC:.4f}")
 
+    # Print tree information
+    leaf_effects = tree.leaf_effects()
+    print(f"\nTree has {len(leaf_effects['leaves'])} leaves")
+    print("\nLeaf effects summary:")
+    for leaf in leaf_effects["leaves"][:10]:  # Show first 10 leaves
+        print(
+            f"  Leaf {leaf['leaf_id']}: tauF={leaf['tauF']:.4f}, "
+            f"tauC={leaf['tauC']:.4f}, n={leaf['n']}"
+        )
+
     # --- plot ---
+    print("\nPlotting tree...")
     fig, ax = plot_divergence_tree(
         tree,
         figsize=(13, 7),
