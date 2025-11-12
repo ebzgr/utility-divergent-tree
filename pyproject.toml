@@ -16,6 +16,7 @@ dependencies = [
     "matplotlib>=3.7",
     "optuna>=3.2",
     "scikit_learn>=1.7.2",
+    "econml>=0.14.0",
 ]
 
 [project.urls]

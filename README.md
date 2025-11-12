@@ -29,10 +29,16 @@ python -m venv .venv
 source .venv/bin/activate
 ```
 
-3. Install dependencies and package:
+3. Install the package (dependencies are installed automatically):
 
 ```bash
-pip install -r requirements.txt  # Installs dependencies with specific versions
+pip install -e .
+```
+
+Alternatively, for exact version reproducibility, install dependencies first:
+
+```bash
+pip install -r requirements.txt  # Optional: ensures exact dependency versions
 pip install -e .                 # Installs the package in editable mode
 ```
 
