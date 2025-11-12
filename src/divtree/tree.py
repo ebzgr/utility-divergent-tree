@@ -477,10 +477,20 @@ class DivergenceTree:
 
         for f in range(p):
             x_split = X[indices, f]
-            if np.unique(x_split).size <= 1:
+            unique_vals = np.unique(x_split)
+            if unique_vals.size <= 1:
                 continue
-            qs = np.linspace(0, 1, self.n_quantiles + 2)[1:-1]
-            thresholds = np.unique(np.quantile(x_split, qs, method="nearest"))
+            
+            # Optimize for binary features (0/1 only)
+            # For binary features, we only need one threshold at 0.5
+            if unique_vals.size == 2 and np.all(np.isin(unique_vals, [0, 1])):
+                # Binary feature: use single threshold at 0.5
+                thresholds = [0.5]
+            else:
+                # Continuous feature: use quantiles
+                qs = np.linspace(0, 1, self.n_quantiles + 2)[1:-1]
+                thresholds = np.unique(np.quantile(x_split, qs, method="nearest"))
+            
             for thr in thresholds:
                 candidates.append(
                     {

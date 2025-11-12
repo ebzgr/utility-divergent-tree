@@ -1,8 +1,8 @@
 """
-Example: How to use the new comparison data generator with divergence tree.
+Simulation script using random data generator for comparison.
 
-This shows the complete workflow with continuous outcomes:
-1. Generate data with continuous firm and user outcomes (both always observed)
+This shows the complete workflow with random data generation:
+1. Generate data using random coefficients and standard DGP structure
 2. Optimize hyperparameters using cross-validation
 3. Train divergence tree with best parameters
 4. Train alternative two-step method
@@ -10,7 +10,7 @@ This shows the complete workflow with continuous outcomes:
 6. Visualize the tree
 
 The workflow is split into 4 independent steps that can be run separately:
-Step 1: Generate and save data
+Step 1: Generate and save data (with functional form)
 Step 2: Load data, run DivergenceTree, save results
 Step 3: Load data, run TwoStepDivergenceTree, save results
 Step 4: Load results and compare
@@ -22,7 +22,7 @@ import os
 import sys
 import pickle
 from typing import Dict, Any, Tuple, Optional
-from data_generator import generate_comparison_data, get_data_summary
+from random_data_generator import generate_random_comparison_data, get_data_summary
 
 # Add the src directory to the path to import divtree
 sys.path.append(os.path.join(os.path.dirname(__file__), "..", "..", "src"))
@@ -36,27 +36,27 @@ from comparison_helper import compare_methods, print_comparison
 # Use data folder in the same directory as this script
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 DATA_DIR = os.path.join(SCRIPT_DIR, "data")
-DATA_FILE = os.path.join(DATA_DIR, "comparison_data.pickle")
-DIVTREE_RESULTS_FILE = os.path.join(DATA_DIR, "divtree_results.pickle")
-TWOSTEP_RESULTS_FILE = os.path.join(DATA_DIR, "twostep_results.pickle")
+DATA_FILE = os.path.join(DATA_DIR, "random_comparison_data.pickle")
+DIVTREE_RESULTS_FILE = os.path.join(DATA_DIR, "random_divtree_results.pickle")
+TWOSTEP_RESULTS_FILE = os.path.join(DATA_DIR, "random_twostep_results.pickle")
 
 # ===================== GLOBAL RANDOM SEED =====================
 # Single random seed for all randomness in the simulation
-RANDOM_SEED = 0
+RANDOM_SEED = 7
 # ======================================================
 
 
 def generate_data(
-    n_users_train: int = 20000,
-    n_users_test: int = 5000,
+    n_users_train: int = 5000,
+    n_users_test: int = 2000,
     n_features: int = 10,
-    firm_outcome_base: float = 0.0,
+    n_active_features: int = 5,
+    overlap: float = 0.5,
+    intensity: float = 1.0,
+    effect_noise_std: float = 0.0,
     firm_outcome_noise_std: float = 1.0,
-    user_outcome_base: float = 0.0,
     user_outcome_noise_std: float = 1.0,
     random_seed: int = RANDOM_SEED,
-    firm_effect_strength: float = 1.0,
-    user_effect_strength: float = 1.0,
 ) -> Tuple[
     np.ndarray,
     np.ndarray,
@@ -68,32 +68,33 @@ def generate_data(
     np.ndarray,
     np.ndarray,
     np.ndarray,
+    Dict[str, Any],
 ]:
     """
-    Generate synthetic training and test data with continuous outcomes.
+    Generate synthetic training and test data using random data generator.
 
     Parameters
     ----------
-    n_users_train : int, default=20000
+    n_users_train : int, default=5000
         Number of training observations to generate.
-    n_users_test : int, default=5000
+    n_users_test : int, default=2000
         Number of test observations to generate.
     n_features : int, default=10
-        Number of features.
-    firm_outcome_base : float, default=0.0
-        Base value for firm outcome.
+        Total number of features.
+    n_active_features : int, default=5
+        Number of features used for generating each treatment effect.
+    overlap : float, default=0.5
+        Proportion of features shared between firm and user treatment effects.
+    intensity : float, default=1.0
+        Scales the treatment effects after normalization.
+    effect_noise_std : float, default=0.0
+        Standard deviation of noise added to treatment effects.
     firm_outcome_noise_std : float, default=1.0
         Standard deviation of noise for firm outcome.
-    user_outcome_base : float, default=0.0
-        Base value for user outcome.
     user_outcome_noise_std : float, default=1.0
         Standard deviation of noise for user outcome.
     random_seed : int, default=RANDOM_SEED
         Random seed for both training and test data.
-    firm_effect_strength : float, default=1.0
-        Direct firm effect strength.
-    user_effect_strength : float, default=1.0
-        Direct user effect strength.
 
     Returns
     -------
@@ -117,38 +118,52 @@ def generate_data(
         Test consumer outcome.
     region_type_test : np.ndarray
         Test true region type labels (1-4).
+    functional_form : dict
+        Functional form information (coefficients, feature indices, etc.).
     """
-    print("Generating training and test data with continuous outcomes...")
+    print("Generating training and test data using random data generator...")
 
-    # Generate training data
-    X_train, T_train, YF_train, YC_train, tauF_train, tauC_train, region_type_train = (
-        generate_comparison_data(
-            n_users=n_users_train,
-            n_features=n_features,
-            firm_outcome_base=firm_outcome_base,
-            firm_outcome_noise_std=firm_outcome_noise_std,
-            user_outcome_base=user_outcome_base,
-            user_outcome_noise_std=user_outcome_noise_std,
-            random_seed=random_seed,
-            firm_effect_strength=firm_effect_strength,
-            user_effect_strength=user_effect_strength,
-        )
+    # Generate all data at once to ensure same functional form (coefficients, feature selection, etc.)
+    n_users_total = n_users_train + n_users_test
+    (
+        X_all,
+        T_all,
+        YF_all,
+        YC_all,
+        tauF_all,
+        tauC_all,
+        region_type_all,
+        functional_form,
+    ) = generate_random_comparison_data(
+        n_users=n_users_total,
+        n_features=n_features,
+        n_active_features=n_active_features,
+        overlap=overlap,
+        intensity=intensity,
+        effect_noise_std=effect_noise_std,
+        firm_outcome_noise_std=firm_outcome_noise_std,
+        user_outcome_noise_std=user_outcome_noise_std,
+        random_seed=random_seed,
     )
 
-    # Generate test data (using the same random seed)
-    X_test, T_test, YF_test, YC_test, tauF_test, tauC_test, region_type_test = (
-        generate_comparison_data(
-            n_users=n_users_test,
-            n_features=n_features,
-            firm_outcome_base=firm_outcome_base,
-            firm_outcome_noise_std=firm_outcome_noise_std,
-            user_outcome_base=user_outcome_base,
-            user_outcome_noise_std=user_outcome_noise_std,
-            random_seed=random_seed,
-            firm_effect_strength=firm_effect_strength,
-            user_effect_strength=user_effect_strength,
-        )
-    )
+    # Split into train and test sets using random permutation
+    rng = np.random.default_rng(random_seed)
+    indices = rng.permutation(n_users_total)
+    train_indices = indices[:n_users_train]
+    test_indices = indices[n_users_train:]
+
+    # Split the data
+    X_train = X_all[train_indices]
+    T_train = T_all[train_indices]
+    YF_train = YF_all[train_indices]
+    YC_train = YC_all[train_indices]
+    region_type_train = region_type_all[train_indices]
+
+    X_test = X_all[test_indices]
+    T_test = T_all[test_indices]
+    YF_test = YF_all[test_indices]
+    YC_test = YC_all[test_indices]
+    region_type_test = region_type_all[test_indices]
 
     # Print ground truth region type distribution for training
     print(f"\nTraining ground truth region type distribution:")
@@ -196,6 +211,7 @@ def generate_data(
         YF_test,
         YC_test,
         region_type_test,
+        functional_form,
     )
 
 
@@ -210,6 +226,7 @@ def save_data(
     YF_test: np.ndarray,
     YC_test: np.ndarray,
     region_type_test: np.ndarray,
+    functional_form: Dict[str, Any],
     filepath: str = DATA_FILE,
 ):
     """Save training and test data to pickle file."""
@@ -225,13 +242,14 @@ def save_data(
         "YF_test": YF_test,
         "YC_test": YC_test,
         "region_type_test": region_type_test,
+        "functional_form": functional_form,
     }
     with open(filepath, "wb") as f:
         pickle.dump(data, f)
     print(f"\nData saved to: {filepath}")
 
 
-def load_data(filepath: str = DATA_FILE) -> Dict[str, np.ndarray]:
+def load_data(filepath: str = DATA_FILE) -> Dict[str, Any]:
     """Load training and test data from pickle file."""
     with open(filepath, "rb") as f:
         data = pickle.load(f)
@@ -243,7 +261,7 @@ def load_data(filepath: str = DATA_FILE) -> Dict[str, np.ndarray]:
 def step1_generate_and_save_data():
     """Step 1: Generate training and test data and save to file."""
     print("=" * 60)
-    print("STEP 1: Generate and Save Data")
+    print("STEP 1: Generate and Save Data (Random Generator)")
     print("=" * 60)
 
     # Generate data
@@ -258,18 +276,39 @@ def step1_generate_and_save_data():
         YF_test,
         YC_test,
         region_type_test,
+        functional_form,
     ) = generate_data(
-        n_users_train=5000,
-        n_users_test=2000,
+        n_users_train=10000,
+        n_users_test=5000,
         n_features=10,
-        firm_outcome_base=0.0,
-        firm_outcome_noise_std=1,
-        user_outcome_base=0.0,
-        user_outcome_noise_std=1,
+        n_active_features=3,
+        overlap=1,
+        intensity=4,
+        effect_noise_std=0.0,
+        firm_outcome_noise_std=0.0,
+        user_outcome_noise_std=0.0,
         random_seed=RANDOM_SEED,
-        firm_effect_strength=1,
-        user_effect_strength=1,
     )
+
+    # Print functional form information
+    print("\n" + "=" * 60)
+    print("Functional Form Information")
+    print("=" * 60)
+    print(
+        f"  Firm baseline uses all {len(functional_form['baseline_coef_F'])} features"
+    )
+    print(
+        f"  User baseline uses all {len(functional_form['baseline_coef_C'])} features"
+    )
+    print(
+        f"  Firm treatment effect uses {len(functional_form['firm_selected_features'])} features: {functional_form['firm_selected_features']}"
+    )
+    print(
+        f"  User treatment effect uses {len(functional_form['user_selected_features'])} features: {functional_form['user_selected_features']}"
+    )
+    print(f"  Shared features: {functional_form['shared_features']}")
+    print(f"  Overlap: {functional_form['overlap']:.2f}")
+    print(f"  Intensity: {functional_form['intensity']:.2f}")
 
     # Save data
     save_data(
@@ -283,6 +322,7 @@ def step1_generate_and_save_data():
         YF_test,
         YC_test,
         region_type_test,
+        functional_form,
     )
 
     print("\nStep 1 complete!")
@@ -459,6 +499,7 @@ def step4_compare_results():
     # Load data
     data = load_data()
     region_type_test = data["region_type_test"]
+    functional_form = data.get("functional_form", None)
 
     # Load DivergenceTree results
     print("\nLoading DivergenceTree results...")
@@ -518,7 +559,7 @@ def step4_compare_results():
 
         # Adjust layout and save
         plt.tight_layout()
-        save_path = os.path.join(DATA_DIR, "comparison_trees.png")
+        save_path = os.path.join(DATA_DIR, "random_comparison_trees.png")
         fig.savefig(save_path, dpi=300, bbox_inches="tight")
         plt.close(fig)
         print(f"Tree comparison visualization saved as '{save_path}'")
@@ -526,13 +567,13 @@ def step4_compare_results():
         # Also save individual trees
         fig_div, ax_div = plot_divergence_tree(divtree_tree, figsize=(15, 10))
         fig_div.savefig(
-            os.path.join(DATA_DIR, "divergence_tree.png"),
+            os.path.join(DATA_DIR, "random_divergence_tree.png"),
             dpi=300,
             bbox_inches="tight",
         )
         plt.close(fig_div)
         print(
-            f"DivergenceTree visualization saved as '{os.path.join(DATA_DIR, 'divergence_tree.png')}'"
+            f"DivergenceTree visualization saved as '{os.path.join(DATA_DIR, 'random_divergence_tree.png')}'"
         )
 
         # Individual TwoStepDivergenceTree
@@ -550,13 +591,13 @@ def step4_compare_results():
         ax_twostep.set_title("TwoStepDivergenceTree", fontsize=16, fontweight="bold")
         plt.tight_layout()
         fig_twostep.savefig(
-            os.path.join(DATA_DIR, "twostep_tree.png"),
+            os.path.join(DATA_DIR, "random_twostep_tree.png"),
             dpi=300,
             bbox_inches="tight",
         )
         plt.close(fig_twostep)
         print(
-            f"TwoStepDivergenceTree visualization saved as '{os.path.join(DATA_DIR, 'twostep_tree.png')}'"
+            f"TwoStepDivergenceTree visualization saved as '{os.path.join(DATA_DIR, 'random_twostep_tree.png')}'"
         )
 
     except Exception as e:

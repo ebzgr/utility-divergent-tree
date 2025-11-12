@@ -203,7 +203,7 @@ def tune_with_optuna(
 
     sampler = optuna.samplers.TPESampler(seed=random_state)
     study = optuna.create_study(direction="minimize", sampler=sampler)
-    study.optimize(objective, n_trials=n_trials, show_progress_bar=False)
+    study.optimize(objective, n_trials=n_trials, show_progress_bar=True)
 
     # Check if any trials completed successfully
     if len(study.trials) == 0 or study.best_trial is None:

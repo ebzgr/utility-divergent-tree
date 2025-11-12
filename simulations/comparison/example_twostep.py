@@ -101,37 +101,24 @@ def run_example():
     # Define fixed parameters for causal forest
     causal_forest_params = {
         "random_state": 42,
-        "n_estimators": 100,  # Can adjust if needed
         "n_jobs": -1,  # Use all available CPUs for parallelization
     }
 
-    # Parameters for causal forest tuning (uses econml's built-in tune())
     causal_forest_tune_params = {
-        "params": "auto",  # Use econml's default grid
+        "params": "auto",  # Use econml's default tuning grid
     }
-
-    # Fixed parameters for classification tree (will be used as fixed params during tuning)
     classification_tree_params = {
         "random_state": 42,
     }
 
-    # Optional: customize search space for classification tree
-    classification_tree_search_space = {
-        "max_depth": {"low": 2, "high": 15},
-        "min_samples_split": {"low": 2, "high": 20},
-        "min_samples_leaf": {"low": 1, "high": 10},
-    }
-
     print(f"Causal forest params: {causal_forest_params}")
     print(f"Causal forest tune params: {causal_forest_tune_params}")
-    print(f"Classification tree base params: {classification_tree_params}")
-    print(f"Classification tree search space: {classification_tree_search_space}")
 
     # Create and fit tree with automatic tuning
     tree = TwoStepDivergenceTree(
         causal_forest_params=causal_forest_params,
-        causal_forest_tune_params=causal_forest_tune_params,
         classification_tree_params=classification_tree_params,
+        causal_forest_tune_params=causal_forest_tune_params,
     )
     tree.fit(
         X_train,
@@ -139,9 +126,6 @@ def run_example():
         YF_train,
         YC_train,
         auto_tune_classification_tree=True,
-        classification_tree_search_space=classification_tree_search_space,
-        classification_tree_tune_n_trials=20,  # Adjust based on your needs
-        classification_tree_tune_n_splits=2,
     )
 
     # 4. Print tree information

@@ -1,8 +1,8 @@
 """
-Example: How to use the new comparison data generator with divergence tree.
+Simulation script using binary data generator for comparison.
 
-This shows the complete workflow with continuous outcomes:
-1. Generate data with continuous firm and user outcomes (both always observed)
+This shows the complete workflow with binary categorical data:
+1. Generate data using binary features (one-hot encoded categorical variables)
 2. Optimize hyperparameters using cross-validation
 3. Train divergence tree with best parameters
 4. Train alternative two-step method
@@ -10,7 +10,7 @@ This shows the complete workflow with continuous outcomes:
 6. Visualize the tree
 
 The workflow is split into 4 independent steps that can be run separately:
-Step 1: Generate and save data
+Step 1: Generate and save data (with functional form)
 Step 2: Load data, run DivergenceTree, save results
 Step 3: Load data, run TwoStepDivergenceTree, save results
 Step 4: Load results and compare
@@ -22,7 +22,7 @@ import os
 import sys
 import pickle
 from typing import Dict, Any, Tuple, Optional
-from data_generator import generate_comparison_data, get_data_summary
+from binary_data_generator import generate_binary_comparison_data, get_data_summary
 
 # Add the src directory to the path to import divtree
 sys.path.append(os.path.join(os.path.dirname(__file__), "..", "..", "src"))
@@ -30,15 +30,18 @@ from divtree.tree import DivergenceTree
 from divtree.tune import tune_with_optuna as tune_divtree
 from divtree.viz import plot_divergence_tree
 from twostepdivtree.tree import TwoStepDivergenceTree
+
+# Import comparison helper from parent directory
+sys.path.append(os.path.join(os.path.dirname(__file__), "..", "comparison"))
 from comparison_helper import compare_methods, print_comparison
 
 # ===================== GLOBAL PATHS =====================
 # Use data folder in the same directory as this script
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 DATA_DIR = os.path.join(SCRIPT_DIR, "data")
-DATA_FILE = os.path.join(DATA_DIR, "comparison_data.pickle")
-DIVTREE_RESULTS_FILE = os.path.join(DATA_DIR, "divtree_results.pickle")
-TWOSTEP_RESULTS_FILE = os.path.join(DATA_DIR, "twostep_results.pickle")
+DATA_FILE = os.path.join(DATA_DIR, "binary_comparison_data.pickle")
+DIVTREE_RESULTS_FILE = os.path.join(DATA_DIR, "binary_divtree_results.pickle")
+TWOSTEP_RESULTS_FILE = os.path.join(DATA_DIR, "binary_twostep_results.pickle")
 
 # ===================== GLOBAL RANDOM SEED =====================
 # Single random seed for all randomness in the simulation
@@ -47,16 +50,19 @@ RANDOM_SEED = 0
 
 
 def generate_data(
-    n_users_train: int = 20000,
-    n_users_test: int = 5000,
-    n_features: int = 10,
-    firm_outcome_base: float = 0.0,
+    n_users_train: int = 5000,
+    n_users_test: int = 2000,
+    k: int = 3,
+    n_categories: list = [3, 4, 5],
+    m_firm: int = 5,
+    m_user: Optional[int] = None,
+    similarity: float = 0.5,
+    intensity: float = 2.0,
+    effect_noise_std: float = 0.1,
     firm_outcome_noise_std: float = 1.0,
-    user_outcome_base: float = 0.0,
     user_outcome_noise_std: float = 1.0,
+    positive_ratio: float = 0.5,
     random_seed: int = RANDOM_SEED,
-    firm_effect_strength: float = 1.0,
-    user_effect_strength: float = 1.0,
 ) -> Tuple[
     np.ndarray,
     np.ndarray,
@@ -68,122 +74,93 @@ def generate_data(
     np.ndarray,
     np.ndarray,
     np.ndarray,
+    Dict[str, Any],
 ]:
     """
-    Generate synthetic training and test data with continuous outcomes.
+    Generate synthetic training and test data using binary data generator.
 
     Parameters
     ----------
-    n_users_train : int, default=20000
+    n_users_train : int, default=5000
         Number of training observations to generate.
-    n_users_test : int, default=5000
+    n_users_test : int, default=2000
         Number of test observations to generate.
-    n_features : int, default=10
-        Number of features.
-    firm_outcome_base : float, default=0.0
-        Base value for firm outcome.
+    k : int, default=3
+        Number of categorical variables.
+    n_categories : list, default=[3, 4, 5]
+        List of k integers, number of categories per variable.
+    m_firm : int, default=5
+        Number of combinations activating firm treatment effect.
+    m_user : int, optional
+        Number of combinations activating user treatment effect.
+    similarity : float, default=0.5
+        Proportion of combinations shared between firm and user.
+    intensity : float, default=2.0
+        Treatment effect intensity when activated.
+    effect_noise_std : float, default=0.1
+        Standard deviation of noise added to all treatment effects (mean=0).
     firm_outcome_noise_std : float, default=1.0
         Standard deviation of noise for firm outcome.
-    user_outcome_base : float, default=0.0
-        Base value for user outcome.
     user_outcome_noise_std : float, default=1.0
         Standard deviation of noise for user outcome.
+    positive_ratio : float, default=0.5
+        Minimum proportion of observations in activating combinations that should
+        have positive treatment effects (after noise is added). Must be in [0, 1].
     random_seed : int, default=RANDOM_SEED
         Random seed for both training and test data.
-    firm_effect_strength : float, default=1.0
-        Direct firm effect strength.
-    user_effect_strength : float, default=1.0
-        Direct user effect strength.
 
     Returns
     -------
-    X_train : np.ndarray
-        Training feature matrix.
-    T_train : np.ndarray
-        Training treatment indicator.
-    YF_train : np.ndarray
-        Training firm outcome.
-    YC_train : np.ndarray
-        Training consumer outcome.
-    region_type_train : np.ndarray
-        Training true region type labels (1-4).
-    X_test : np.ndarray
-        Test feature matrix.
-    T_test : np.ndarray
-        Test treatment indicator.
-    YF_test : np.ndarray
-        Test firm outcome.
-    YC_test : np.ndarray
-        Test consumer outcome.
-    region_type_test : np.ndarray
-        Test true region type labels (1-4).
+    X_train, T_train, YF_train, YC_train, region_type_train,
+    X_test, T_test, YF_test, YC_test, region_type_test,
+    functional_form
     """
-    print("Generating training and test data with continuous outcomes...")
+    print("Generating training and test data using binary data generator...")
 
-    # Generate training data
-    X_train, T_train, YF_train, YC_train, tauF_train, tauC_train, region_type_train = (
-        generate_comparison_data(
-            n_users=n_users_train,
-            n_features=n_features,
-            firm_outcome_base=firm_outcome_base,
-            firm_outcome_noise_std=firm_outcome_noise_std,
-            user_outcome_base=user_outcome_base,
-            user_outcome_noise_std=user_outcome_noise_std,
-            random_seed=random_seed,
-            firm_effect_strength=firm_effect_strength,
-            user_effect_strength=user_effect_strength,
-        )
+    # Generate all data at once to ensure same functional form (coefficients, combinations, etc.)
+    n_users_total = n_users_train + n_users_test
+    (
+        X_all,
+        T_all,
+        YF_all,
+        YC_all,
+        tauF_all,
+        tauC_all,
+        region_type_all,
+        functional_form,
+    ) = generate_binary_comparison_data(
+        n_users=n_users_total,
+        k=k,
+        n_categories=n_categories,
+        m_firm=m_firm,
+        m_user=m_user,
+        similarity=similarity,
+        intensity=intensity,
+        effect_noise_std=effect_noise_std,
+        firm_outcome_noise_std=firm_outcome_noise_std,
+        user_outcome_noise_std=user_outcome_noise_std,
+        positive_ratio=positive_ratio,
+        random_seed=random_seed,
     )
 
-    # Generate test data (using the same random seed)
-    X_test, T_test, YF_test, YC_test, tauF_test, tauC_test, region_type_test = (
-        generate_comparison_data(
-            n_users=n_users_test,
-            n_features=n_features,
-            firm_outcome_base=firm_outcome_base,
-            firm_outcome_noise_std=firm_outcome_noise_std,
-            user_outcome_base=user_outcome_base,
-            user_outcome_noise_std=user_outcome_noise_std,
-            random_seed=random_seed,
-            firm_effect_strength=firm_effect_strength,
-            user_effect_strength=user_effect_strength,
-        )
-    )
+    # Split into train and test sets using random permutation
+    rng = np.random.default_rng(random_seed)
+    indices = rng.permutation(n_users_total)
+    train_indices = indices[:n_users_train]
+    test_indices = indices[n_users_train:]
 
-    # Print ground truth region type distribution for training
-    print(f"\nTraining ground truth region type distribution:")
-    for rt in [1, 2, 3, 4]:
-        count = (region_type_train == rt).sum()
-        print(
-            f"  Region {rt}: {count} observations ({100*count/len(region_type_train):.2f}%)"
-        )
+    # Split the data
+    X_train = X_all[train_indices]
+    T_train = T_all[train_indices]
+    YF_train = YF_all[train_indices]
+    YC_train = YC_all[train_indices]
+    region_type_train = region_type_all[train_indices]
 
-    # Print ground truth region type distribution for test
-    print(f"\nTest ground truth region type distribution:")
-    for rt in [1, 2, 3, 4]:
-        count = (region_type_test == rt).sum()
-        print(
-            f"  Region {rt}: {count} observations ({100*count/len(region_type_test):.2f}%)"
-        )
-
-    # Verify both outcomes are always observed
-    print(f"\nTraining data verification:")
-    print(f"  YF has NaN: {np.isnan(YF_train).any()}")
-    print(f"  YC has NaN: {np.isnan(YC_train).any()}")
-
-    print(f"\nTest data verification:")
-    print(f"  YF has NaN: {np.isnan(YF_test).any()}")
-    print(f"  YC has NaN: {np.isnan(YC_test).any()}")
-
-    # Get training data summary
-    print("\nTraining Data Summary:")
-    summary = get_data_summary(X_train, T_train, YF_train, YC_train)
-    for key, value in summary.items():
-        print(
-            f"  {key}: {value:.4f}"
-            if isinstance(value, (int, float))
-            else f"  {key}: {value}"
-        )
+    X_test = X_all[test_indices]
+    T_test = T_all[test_indices]
+    YF_test = YF_all[test_indices]
+    YC_test = YC_all[test_indices]
+    region_type_test = region_type_all[test_indices]
 
     return (
         X_train,
@@ -196,6 +173,7 @@ def generate_data(
         YF_test,
         YC_test,
         region_type_test,
+        functional_form,
     )
 
 
@@ -210,6 +188,7 @@ def save_data(
     YF_test: np.ndarray,
     YC_test: np.ndarray,
     region_type_test: np.ndarray,
+    functional_form: Dict[str, Any],
     filepath: str = DATA_FILE,
 ):
     """Save training and test data to pickle file."""
@@ -225,13 +204,14 @@ def save_data(
         "YF_test": YF_test,
         "YC_test": YC_test,
         "region_type_test": region_type_test,
+        "functional_form": functional_form,
     }
     with open(filepath, "wb") as f:
         pickle.dump(data, f)
     print(f"\nData saved to: {filepath}")
 
 
-def load_data(filepath: str = DATA_FILE) -> Dict[str, np.ndarray]:
+def load_data(filepath: str = DATA_FILE) -> Dict[str, Any]:
     """Load training and test data from pickle file."""
     with open(filepath, "rb") as f:
         data = pickle.load(f)
@@ -243,7 +223,7 @@ def load_data(filepath: str = DATA_FILE) -> Dict[str, np.ndarray]:
 def step1_generate_and_save_data():
     """Step 1: Generate training and test data and save to file."""
     print("=" * 60)
-    print("STEP 1: Generate and Save Data")
+    print("STEP 1: Generate and Save Data (Binary Generator)")
     print("=" * 60)
 
     # Generate data
@@ -258,18 +238,67 @@ def step1_generate_and_save_data():
         YF_test,
         YC_test,
         region_type_test,
+        functional_form,
     ) = generate_data(
-        n_users_train=5000,
-        n_users_test=2000,
-        n_features=10,
-        firm_outcome_base=0.0,
-        firm_outcome_noise_std=1,
-        user_outcome_base=0.0,
-        user_outcome_noise_std=1,
+        n_users_train=20000,
+        n_users_test=10000,
+        k=3,
+        n_categories=[6, 6, 6],
+        m_firm=10,
+        m_user=10,
+        similarity=0.8,
+        intensity=1,
+        effect_noise_std=3,
+        firm_outcome_noise_std=4,
+        user_outcome_noise_std=4,
+        positive_ratio=0.6,
         random_seed=RANDOM_SEED,
-        firm_effect_strength=1,
-        user_effect_strength=1,
     )
+
+    # Print functional form information with combinations
+    print("\n" + "=" * 60)
+    print("Functional Form Information")
+    print("=" * 60)
+    print(f"  Number of categorical variables (k): {functional_form['k']}")
+    print(f"  Categories per variable: {functional_form['n_categories']}")
+    print(f"  Firm activating combinations: {functional_form['m_firm']}")
+    print(f"  User activating combinations: {functional_form['m_user']}")
+    print(f"  Similarity: {functional_form['similarity']:.2f}")
+    print(f"  Intensity: {functional_form['intensity']:.2f}")
+    print(
+        f"  Shared combinations: {len(set(functional_form['firm_combinations']) & set(functional_form['user_combinations']))}"
+    )
+
+    print(f"\n  Firm Treatment Effect Combinations:")
+    for i, (combo, sign) in enumerate(
+        zip(functional_form["firm_combinations"], functional_form["firm_signs"])
+    ):
+        sign_str = "+" if sign > 0 else "-"
+        print(
+            f"    {i+1}. {combo} -> sign={sign_str}, effect={sign * functional_form['intensity']:.2f}"
+        )
+
+    print(f"\n  User Treatment Effect Combinations:")
+    for i, (combo, sign) in enumerate(
+        zip(functional_form["user_combinations"], functional_form["user_signs"])
+    ):
+        sign_str = "+" if sign > 0 else "-"
+        print(
+            f"    {i+1}. {combo} -> sign={sign_str}, effect={sign * functional_form['intensity']:.2f}"
+        )
+
+    # Check shared combinations
+    firm_set = set(functional_form["firm_combinations"])
+    user_set = set(functional_form["user_combinations"])
+    shared = firm_set & user_set
+    if len(shared) > 0:
+        print(f"\n  Shared Combinations:")
+        for combo in shared:
+            firm_idx = functional_form["firm_combinations"].index(combo)
+            user_idx = functional_form["user_combinations"].index(combo)
+            firm_sign = functional_form["firm_signs"][firm_idx]
+            user_sign = functional_form["user_signs"][user_idx]
+            print(f"    {combo}: Firm sign={firm_sign}, User sign={user_sign}")
 
     # Save data
     save_data(
@@ -283,6 +312,7 @@ def step1_generate_and_save_data():
         YF_test,
         YC_test,
         region_type_test,
+        functional_form,
     )
 
     print("\nStep 1 complete!")
@@ -307,18 +337,21 @@ def step2_run_divergence_tree():
     print("\nRunning DivergenceTree hyperparameter optimization...")
     fixed_params = {
         "lambda_": 1,
-        "n_quantiles": 100,
+        "n_quantiles": 3,
         "random_state": RANDOM_SEED,
         "co_movement": "both",
         "eps_scale": 1e-8,
     }
     search_space = {
-        "max_partitions": {"low": 4, "high": 15},
-        "min_improvement_ratio": {"low": 0.001, "high": 0.05, "log": True},
+        "max_partitions": {"low": 4, "high": 100},
+        "min_improvement_ratio": {"low": 0.001, "high": 0.1, "log": True},
     }
 
     print(f"Fixed parameters: {fixed_params}")
     print(f"Search space: {search_space}")
+    print(f"Number of trials: 20")
+    print(f"Number of CV folds: 2")
+    print("\nStarting hyperparameter optimization (this may take a while)...")
 
     # Tune hyperparameters on training set
     best_params, best_loss = tune_divtree(
@@ -328,12 +361,13 @@ def step2_run_divergence_tree():
         YC_train,
         fixed=fixed_params,
         search_space=search_space,
-        n_trials=20,
+        n_trials=30,
         n_splits=2,
         random_state=RANDOM_SEED,
     )
 
-    print(f"\nBest parameters found: {best_params}")
+    print(f"\nHyperparameter optimization complete!")
+    print(f"Best parameters found: {best_params}")
     print(f"Best CV loss: {best_loss:.6f}")
 
     # Train final tree with best parameters
@@ -345,6 +379,28 @@ def step2_run_divergence_tree():
     leaf_effects = tree.leaf_effects()
     print(f"\nTree has {len(leaf_effects['leaves'])} leaves")
 
+    # Check training accuracy
+    print("\nChecking training set accuracy...")
+    region_type_pred_train = tree.predict_region_type(X_train)
+    region_type_train = data["region_type_train"]
+    accuracy_train = (region_type_pred_train == region_type_train).mean()
+    print(f"Training set region type prediction accuracy: {accuracy_train:.4f}")
+
+    # Plot and save the tree
+    try:
+        print("\nPlotting DivergenceTree...")
+        os.makedirs(os.path.dirname(DIVTREE_RESULTS_FILE), exist_ok=True)
+        fig, ax = plot_divergence_tree(tree, figsize=(15, 10))
+        tree_plot_path = os.path.join(DATA_DIR, "binary_divergence_tree_step2.png")
+        fig.savefig(tree_plot_path, dpi=300, bbox_inches="tight")
+        plt.close(fig)
+        print(f"Tree visualization saved as '{tree_plot_path}'")
+    except Exception as e:
+        print(f"Could not create tree visualization: {e}")
+        import traceback
+
+        traceback.print_exc()
+
     # Predict on test set
     print("\nPredicting on test set...")
     region_type_pred_test = tree.predict_region_type(X_test)
@@ -355,6 +411,30 @@ def step2_run_divergence_tree():
     accuracy_test = (region_type_pred_test == region_type_test).mean()
 
     print(f"\nTest set region type prediction accuracy: {accuracy_test:.4f}")
+
+    # Diagnostic: Check region type distributions
+    print("\nRegion type distribution comparison:")
+    print("  Training set (true):")
+    for rt in [1, 2, 3, 4]:
+        count = (region_type_train == rt).sum()
+        print(f"    Region {rt}: {count} ({100*count/len(region_type_train):.2f}%)")
+    print("  Test set (true):")
+    for rt in [1, 2, 3, 4]:
+        count = (region_type_test == rt).sum()
+        print(f"    Region {rt}: {count} ({100*count/len(region_type_test):.2f}%)")
+    print("  Test set (predicted):")
+    for rt in [1, 2, 3, 4]:
+        count = (region_type_pred_test == rt).sum()
+        print(f"    Region {rt}: {count} ({100*count/len(region_type_pred_test):.2f}%)")
+
+    # Diagnostic: Confusion matrix
+    from sklearn.metrics import confusion_matrix
+
+    cm = confusion_matrix(region_type_test, region_type_pred_test, labels=[1, 2, 3, 4])
+    print("\nConfusion matrix (rows=true, cols=predicted):")
+    print("      ", " ".join([f"Pred {i}" for i in [1, 2, 3, 4]]))
+    for i, row in enumerate(cm):
+        print(f"True {i+1}:", " ".join([f"{val:6d}" for val in row]))
 
     # Save results
     results = {
@@ -422,9 +502,24 @@ def step3_run_twostep_tree():
     leaf_effects = tree.leaf_effects()
     print(f"\nTwoStepDivergenceTree has {len(leaf_effects['leaves'])} leaves")
 
+    # Check training accuracy
+    print("\nChecking training set accuracy...")
+    region_type_pred_train = tree.predict_region_type(X_train)
+    region_type_train = data["region_type_train"]
+    accuracy_train = (region_type_pred_train == region_type_train).mean()
+    print(f"Training set region type prediction accuracy: {accuracy_train:.4f}")
+
+    # Get estimated treatment effects for training set
+    print("\nExtracting estimated treatment effects for training set...")
+    tauF_train_est, tauC_train_est = tree.get_training_treatment_effects()
+
     # Predict on test set
     print("\nPredicting on test set...")
     region_type_pred_test = tree.predict_region_type(X_test)
+
+    # Get estimated treatment effects for test set
+    print("Extracting estimated treatment effects for test set...")
+    tauF_test_est, tauC_test_est = tree.predict_treatment_effects(X_test)
 
     # Calculate performance metrics
     data_test = load_data()
@@ -433,12 +528,57 @@ def step3_run_twostep_tree():
 
     print(f"\nTest set region type prediction accuracy: {accuracy_test:.4f}")
 
+    # Diagnostic: Check region type distributions
+    print("\nRegion type distribution comparison:")
+    print("  Training set (true):")
+    for rt in [1, 2, 3, 4]:
+        count = (region_type_train == rt).sum()
+        print(f"    Region {rt}: {count} ({100*count/len(region_type_train):.2f}%)")
+    print("  Test set (true):")
+    for rt in [1, 2, 3, 4]:
+        count = (region_type_test == rt).sum()
+        print(f"    Region {rt}: {count} ({100*count/len(region_type_test):.2f}%)")
+    print("  Test set (predicted):")
+    for rt in [1, 2, 3, 4]:
+        count = (region_type_pred_test == rt).sum()
+        print(f"    Region {rt}: {count} ({100*count/len(region_type_pred_test):.2f}%)")
+
+    # Diagnostic: Confusion matrix
+    from sklearn.metrics import confusion_matrix
+
+    cm = confusion_matrix(region_type_test, region_type_pred_test, labels=[1, 2, 3, 4])
+    print("\nConfusion matrix (rows=true, cols=predicted):")
+    print("      ", " ".join([f"Pred {i}" for i in [1, 2, 3, 4]]))
+    for i, row in enumerate(cm):
+        print(f"True {i+1}:", " ".join([f"{val:6d}" for val in row]))
+
+    # Diagnostic: Treatment effect statistics
+    print("\nEstimated Treatment Effects Statistics:")
+    print("  Training set:")
+    print(
+        f"    tauF: mean={tauF_train_est.mean():.4f}, std={tauF_train_est.std():.4f}, min={tauF_train_est.min():.4f}, max={tauF_train_est.max():.4f}"
+    )
+    print(
+        f"    tauC: mean={tauC_train_est.mean():.4f}, std={tauC_train_est.std():.4f}, min={tauC_train_est.min():.4f}, max={tauC_train_est.max():.4f}"
+    )
+    print("  Test set:")
+    print(
+        f"    tauF: mean={tauF_test_est.mean():.4f}, std={tauF_test_est.std():.4f}, min={tauF_test_est.min():.4f}, max={tauF_test_est.max():.4f}"
+    )
+    print(
+        f"    tauC: mean={tauC_test_est.mean():.4f}, std={tauC_test_est.std():.4f}, min={tauC_test_est.min():.4f}, max={tauC_test_est.max():.4f}"
+    )
+
     # Save results
     results = {
         "tree": tree,
         "region_type_pred_test": region_type_pred_test,
         "accuracy_test": accuracy_test,
         "n_leaves": len(leaf_effects["leaves"]),
+        "tauF_train_est": tauF_train_est,
+        "tauC_train_est": tauC_train_est,
+        "tauF_test_est": tauF_test_est,
+        "tauC_test_est": tauC_test_est,
     }
 
     os.makedirs(os.path.dirname(TWOSTEP_RESULTS_FILE), exist_ok=True)
@@ -459,6 +599,7 @@ def step4_compare_results():
     # Load data
     data = load_data()
     region_type_test = data["region_type_test"]
+    functional_form = data.get("functional_form", None)
 
     # Load DivergenceTree results
     print("\nLoading DivergenceTree results...")
@@ -518,7 +659,7 @@ def step4_compare_results():
 
         # Adjust layout and save
         plt.tight_layout()
-        save_path = os.path.join(DATA_DIR, "comparison_trees.png")
+        save_path = os.path.join(DATA_DIR, "binary_comparison_trees.png")
         fig.savefig(save_path, dpi=300, bbox_inches="tight")
         plt.close(fig)
         print(f"Tree comparison visualization saved as '{save_path}'")
@@ -526,13 +667,13 @@ def step4_compare_results():
         # Also save individual trees
         fig_div, ax_div = plot_divergence_tree(divtree_tree, figsize=(15, 10))
         fig_div.savefig(
-            os.path.join(DATA_DIR, "divergence_tree.png"),
+            os.path.join(DATA_DIR, "binary_divergence_tree.png"),
             dpi=300,
             bbox_inches="tight",
         )
         plt.close(fig_div)
         print(
-            f"DivergenceTree visualization saved as '{os.path.join(DATA_DIR, 'divergence_tree.png')}'"
+            f"DivergenceTree visualization saved as '{os.path.join(DATA_DIR, 'binary_divergence_tree.png')}'"
         )
 
         # Individual TwoStepDivergenceTree
@@ -550,13 +691,13 @@ def step4_compare_results():
         ax_twostep.set_title("TwoStepDivergenceTree", fontsize=16, fontweight="bold")
         plt.tight_layout()
         fig_twostep.savefig(
-            os.path.join(DATA_DIR, "twostep_tree.png"),
+            os.path.join(DATA_DIR, "binary_twostep_tree.png"),
             dpi=300,
             bbox_inches="tight",
         )
         plt.close(fig_twostep)
         print(
-            f"TwoStepDivergenceTree visualization saved as '{os.path.join(DATA_DIR, 'twostep_tree.png')}'"
+            f"TwoStepDivergenceTree visualization saved as '{os.path.join(DATA_DIR, 'binary_twostep_tree.png')}'"
         )
 
     except Exception as e:

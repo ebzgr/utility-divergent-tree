@@ -129,10 +129,7 @@ class TwoStepDivergenceTree:
         T: np.ndarray,
         YF: np.ndarray,
         YC: np.ndarray,
-        auto_tune_classification_tree: bool = False,
-        classification_tree_search_space: Optional[Dict[str, Dict[str, Any]]] = None,
-        classification_tree_tune_n_trials: int = 30,
-        classification_tree_tune_n_splits: int = 5,
+        auto_tune_classification_tree: Optional[bool] = None,
     ) -> "TwoStepDivergenceTree":
         """
         Fit the two-step divergence tree.
@@ -147,20 +144,9 @@ class TwoStepDivergenceTree:
             Firm outcome (binary or continuous, may contain NaN).
         YC : np.ndarray of shape (n_samples,)
             Consumer outcome (binary or continuous, may contain NaN).
-        auto_tune_classification_tree : bool, default=False
-            If True, automatically tunes the classification tree hyperparameters
-            using Optuna. If False, uses the provided `classification_tree_params`.
-        classification_tree_search_space : dict, optional
-            Search space for classification tree tuning (Optuna format).
-            Only used if `auto_tune_classification_tree=True`.
-            If None, uses default search space.
-            Format: {"param_name": {"low": value, "high": value, "log": bool, "step": int}}
-        classification_tree_tune_n_trials : int, default=30
-            Number of Optuna trials for classification tree tuning.
-            Only used if `auto_tune_classification_tree=True`.
-        classification_tree_tune_n_splits : int, default=5
-            Number of CV folds for classification tree tuning.
-            Only used if `auto_tune_classification_tree=True`.
+        auto_tune_classification_tree : bool, optional
+            If True or None, automatically tunes the classification tree hyperparameters.
+            If False, uses the provided `classification_tree_params`.
 
         Returns
         -------
@@ -186,48 +172,60 @@ class TwoStepDivergenceTree:
         # Store fit data
         self._fit_data = dict(X=X, T=T, YF=YF, YC=YC)
 
-        # Step 1: Fit causal forests for each outcome with tuning
-        print("Fitting and tuning causal forest for firm outcome (YF)...")
-        self.causal_forest_F_ = CausalForestDML(**self.causal_forest_params)
+        # Default to True if None
+        if auto_tune_classification_tree is None:
+            auto_tune_classification_tree = True
 
+        # Step 1: Fit firm causal forest (with optional tuning)
+        print("Fitting causal forest for firm outcome (YF)...")
+        
         # Handle NaN values for YF
         valid_F = ~np.isnan(YF)
         if valid_F.sum() < 10:
             raise ValueError("Too few valid observations for firm outcome.")
 
-        # Tune causal forest using built-in tune() method
-        tune_params = self.causal_forest_tune_params.get("params", "auto")
-        self.causal_forest_F_.tune(
-            Y=YF[valid_F],
-            T=T[valid_F],
-            X=X[valid_F],
-            params=tune_params,
-        )
-
-        # Fit with tuned parameters
+        # Create causal forest for firm outcome
+        self.causal_forest_F_ = CausalForestDML(**self.causal_forest_params)
+        
+        # Tune if tune params are provided
+        if self.causal_forest_tune_params:
+            print("  Tuning firm causal forest hyperparameters...")
+            self.causal_forest_F_.tune(
+                Y=YF[valid_F],
+                T=T[valid_F],
+                X=X[valid_F],
+                **self.causal_forest_tune_params
+            )
+        
+        # Fit firm causal forest
         self.causal_forest_F_.fit(
             Y=YF[valid_F],
             T=T[valid_F],
             X=X[valid_F],
         )
 
-        print("Fitting and tuning causal forest for consumer outcome (YC)...")
-        self.causal_forest_C_ = CausalForestDML(**self.causal_forest_params)
-
+        # Step 2: Fit user causal forest (with optional tuning)
+        print("Fitting causal forest for consumer outcome (YC)...")
+        
         # Handle NaN values for YC
         valid_C = ~np.isnan(YC)
         if valid_C.sum() < 10:
             raise ValueError("Too few valid observations for consumer outcome.")
 
-        # Tune causal forest using built-in tune() method
-        self.causal_forest_C_.tune(
-            Y=YC[valid_C],
-            T=T[valid_C],
-            X=X[valid_C],
-            params=tune_params,
-        )
-
-        # Fit with tuned parameters
+        # Create causal forest for user outcome
+        self.causal_forest_C_ = CausalForestDML(**self.causal_forest_params)
+        
+        # Tune if tune params are provided
+        if self.causal_forest_tune_params:
+            print("  Tuning user causal forest hyperparameters...")
+            self.causal_forest_C_.tune(
+                Y=YC[valid_C],
+                T=T[valid_C],
+                X=X[valid_C],
+                **self.causal_forest_tune_params
+            )
+        
+        # Fit user causal forest
         self.causal_forest_C_.fit(
             Y=YC[valid_C],
             T=T[valid_C],
@@ -246,30 +244,8 @@ class TwoStepDivergenceTree:
         # Step 3: Train classification tree (with optional auto-tuning)
         if auto_tune_classification_tree:
             print("Auto-tuning classification tree hyperparameters...")
-            # Only pass truly fixed parameters (like random_state) as fixed
-            # Parameters with None or default values should be tuned
-            fixed_params = {}
-            if "random_state" in self.classification_tree_params:
-                fixed_params["random_state"] = self.classification_tree_params[
-                    "random_state"
-                ]
-            # Add any other explicitly fixed params (non-None, non-default values)
-            # that should not be tuned
-            for key, value in self.classification_tree_params.items():
-                if key == "random_state":
-                    continue  # Already handled
-                # Only include as fixed if it's explicitly set (not None and not a default)
-                # For now, we'll let the search space handle tuning these
-                # Users can explicitly set values in classification_tree_params if they want them fixed
-
             ct_params, ct_accuracy = self._tune_classification_tree(
-                X,
-                self.region_types_,
-                fixed=fixed_params,  # Only truly fixed params (like random_state)
-                search_space=classification_tree_search_space,
-                n_trials=classification_tree_tune_n_trials,
-                n_splits=classification_tree_tune_n_splits,
-                random_state=self.classification_tree_params.get("random_state"),
+                X, self.region_types_
             )
             print(f"  Best classification tree accuracy: {ct_accuracy:.6f}")
             # Update classification_tree_params with tuned values
@@ -327,6 +303,170 @@ class TwoStepDivergenceTree:
 
         return region_types
 
+    def _region_type_cv_accuracy(
+        self,
+        X: np.ndarray,
+        region_types: np.ndarray,
+        params: Dict[str, Any],
+        n_splits: int = 5,
+        random_state: Optional[int] = None,
+    ) -> float:
+        """
+        Compute K-fold cross-validated region type classification accuracy.
+
+        Parameters
+        ----------
+        X : np.ndarray
+            Feature matrix.
+        region_types : np.ndarray
+            Region type labels (1-4).
+        params : dict
+            Hyperparameters for DecisionTreeClassifier.
+        n_splits : int, default=5
+            Number of folds for cross-validation.
+        random_state : int, optional
+            Random seed for KFold shuffling.
+
+        Returns
+        -------
+        float
+            Mean cross-validated classification accuracy across all folds.
+        """
+        n = X.shape[0]
+        if len(region_types) != n:
+            raise ValueError(
+                f"Input arrays must have matching lengths: X={n}, region_types={len(region_types)}"
+            )
+
+        kf = KFold(n_splits=n_splits, shuffle=True, random_state=random_state)
+        accuracies = []
+
+        for train_idx, val_idx in kf.split(X):
+            try:
+                clf = DecisionTreeClassifier(**params)
+                clf.fit(X[train_idx], region_types[train_idx])
+                pred = clf.predict(X[val_idx])
+                acc = accuracy_score(region_types[val_idx], pred)
+                accuracies.append(acc)
+            except Exception:
+                accuracies.append(0.0)
+
+        return float(np.mean(accuracies)) if accuracies else 0.0
+
+    def _tune_classification_tree(
+        self,
+        X: np.ndarray,
+        region_types: np.ndarray,
+    ) -> Tuple[Dict[str, Any], float]:
+        """
+        Tune hyperparameters for classification tree using Optuna.
+
+        Uses Optuna's TPE sampler to optimize classification accuracy via
+        K-fold cross-validation.
+
+        Parameters
+        ----------
+        X : np.ndarray
+            Feature matrix.
+        region_types : np.ndarray
+            Region type labels (1-4).
+
+        Returns
+        -------
+        best_params : dict
+            Best hyperparameters found (combines fixed and tuned parameters).
+        best_accuracy : float
+            Best cross-validated classification accuracy.
+        """
+        fixed = {}
+        if "random_state" in self.classification_tree_params:
+            fixed["random_state"] = self.classification_tree_params["random_state"]
+
+        # Default search space
+        search_space = {}
+        if "max_depth" not in self.classification_tree_params:
+            search_space["max_depth"] = {"low": 2, "high": 15}
+        if "min_samples_split" not in self.classification_tree_params:
+            search_space["min_samples_split"] = {"low": 2, "high": 20}
+        if "min_samples_leaf" not in self.classification_tree_params:
+            search_space["min_samples_leaf"] = {"low": 1, "high": 10}
+
+        if len(search_space) == 0:
+            # No parameters to tune, return current params
+            return dict(self.classification_tree_params), 0.0
+
+        random_state = self.classification_tree_params.get("random_state")
+
+        def objective(trial):
+            params = dict(fixed)
+
+            # Handle min_samples_split and min_samples_leaf with constraint
+            if "min_samples_split" in search_space:
+                if "min_samples_leaf" in search_space:
+                    # Both are being tuned: suggest min_samples_leaf first, then constrain min_samples_split
+                    min_samples_leaf = trial.suggest_int(
+                        "min_samples_leaf",
+                        search_space["min_samples_leaf"]["low"],
+                        search_space["min_samples_leaf"]["high"],
+                    )
+                    params["min_samples_leaf"] = min_samples_leaf
+
+                    # Constrain min_samples_split to be at least 2 * min_samples_leaf
+                    min_split_low = max(
+                        search_space["min_samples_split"]["low"],
+                        2 * min_samples_leaf,
+                    )
+                    if min_split_low > search_space["min_samples_split"]["high"]:
+                        return 0.0
+                    params["min_samples_split"] = trial.suggest_int(
+                        "min_samples_split",
+                        min_split_low,
+                        search_space["min_samples_split"]["high"],
+                    )
+                else:
+                    params["min_samples_split"] = trial.suggest_int(
+                        "min_samples_split",
+                        search_space["min_samples_split"]["low"],
+                        search_space["min_samples_split"]["high"],
+                    )
+            elif "min_samples_leaf" in search_space:
+                params["min_samples_leaf"] = trial.suggest_int(
+                    "min_samples_leaf",
+                    search_space["min_samples_leaf"]["low"],
+                    search_space["min_samples_leaf"]["high"],
+                )
+
+            # Suggest other hyperparameters from search space
+            for name, spec in search_space.items():
+                if name in fixed or name in ["min_samples_split", "min_samples_leaf"]:
+                    continue
+                params[name] = trial.suggest_int(name, spec["low"], spec["high"])
+
+            # Add random_state if provided
+            if random_state is not None:
+                params["random_state"] = random_state
+
+            accuracy = self._region_type_cv_accuracy(
+                X, region_types, params, n_splits=5, random_state=random_state
+            )
+            return accuracy if np.isfinite(accuracy) else 0.0
+
+        sampler = optuna.samplers.TPESampler(seed=random_state)
+        study = optuna.create_study(direction="maximize", sampler=sampler)
+        study.optimize(objective, n_trials=30, show_progress_bar=False)
+
+        if len(study.trials) == 0 or study.best_trial is None:
+            raise RuntimeError(
+                "No successful trials completed for classification tree optimization."
+            )
+
+        best_params = dict(fixed)
+        best_params.update(study.best_trial.params)
+        if random_state is not None:
+            best_params["random_state"] = random_state
+
+        return best_params, study.best_value
+
     def predict_region_type(self, X: np.ndarray) -> np.ndarray:
         """
         Predict region types for new observations.
@@ -371,6 +511,22 @@ class TwoStepDivergenceTree:
         tauC = self.causal_forest_C_.effect(X)
 
         return tauF, tauC
+
+    def get_training_treatment_effects(self) -> Tuple[np.ndarray, np.ndarray]:
+        """
+        Return the estimated treatment effects for the training data.
+
+        Returns
+        -------
+        tauF : np.ndarray of shape (n_samples,)
+            Estimated treatment effects for firm outcome on training data.
+        tauC : np.ndarray of shape (n_samples,)
+            Estimated treatment effects for consumer outcome on training data.
+        """
+        if self.tauF_ is None or self.tauC_ is None:
+            raise ValueError("Model has not been fitted. Call fit() first.")
+
+        return self.tauF_, self.tauC_
 
     def leaf_effects(self) -> Dict[str, Any]:
         """
@@ -417,170 +573,3 @@ class TwoStepDivergenceTree:
             )
 
         return {"leaves": leaves}
-
-    # ===============================================================
-    # Classification Tree Tuning Methods
-    # ===============================================================
-
-    def _region_type_cv_accuracy(
-        self,
-        X: np.ndarray,
-        region_types: np.ndarray,
-        params: Dict[str, Any],
-        n_splits: int = 5,
-        random_state: Optional[int] = 123,
-    ) -> float:
-        """
-        Compute K-fold cross-validated region type classification accuracy.
-
-        Parameters
-        ----------
-        X : np.ndarray
-            Feature matrix.
-        region_types : np.ndarray
-            Region type labels (1-4).
-        params : dict
-            Hyperparameters for DecisionTreeClassifier.
-        n_splits : int, default=5
-            Number of folds for cross-validation.
-        random_state : int, optional
-            Random seed for KFold shuffling.
-
-        Returns
-        -------
-        float
-            Mean cross-validated classification accuracy across all folds.
-        """
-        # Input validation
-        n = X.shape[0]
-        if len(region_types) != n:
-            raise ValueError(
-                f"Input arrays must have matching lengths: X={n}, region_types={len(region_types)}"
-            )
-
-        kf = KFold(n_splits=n_splits, shuffle=True, random_state=random_state)
-        accuracies = []
-
-        for train_idx, val_idx in kf.split(X):
-            try:
-                clf = DecisionTreeClassifier(**params)
-                clf.fit(X[train_idx], region_types[train_idx])
-                pred = clf.predict(X[val_idx])
-                acc = accuracy_score(region_types[val_idx], pred)
-                accuracies.append(acc)
-            except Exception:
-                accuracies.append(0.0)
-
-        return float(np.mean(accuracies)) if accuracies else 0.0
-
-    def _tune_classification_tree(
-        self,
-        X: np.ndarray,
-        region_types: np.ndarray,
-        fixed: Optional[Dict[str, Any]] = None,
-        search_space: Optional[Dict[str, Dict[str, Any]]] = None,
-        n_trials: int = 30,
-        n_splits: int = 5,
-        random_state: Optional[int] = 123,
-    ) -> Tuple[Dict[str, Any], float]:
-        """
-        Tune hyperparameters for classification tree using Optuna.
-
-        Uses Optuna's TPE sampler to optimize classification accuracy, similar
-        to the regular divergence tree tuning approach.
-
-        Parameters
-        ----------
-        X : np.ndarray
-            Feature matrix.
-        region_types : np.ndarray
-            Region type labels (1-4).
-        fixed : dict, optional
-            Fixed hyperparameters that will be used in all trials.
-        search_space : dict, optional
-            Search space for classification tree parameters.
-            If None, uses default search space.
-            Format: {"param_name": {"low": value, "high": value, "log": bool, "step": int}}
-        n_trials : int, default=30
-            Number of Optuna optimization trials.
-        n_splits : int, default=5
-            Number of folds for cross-validation.
-        random_state : int, optional
-            Random seed for reproducibility.
-
-        Returns
-        -------
-        best_params : dict
-            Best hyperparameters found (combines fixed and tuned parameters).
-        best_accuracy : float
-            Best cross-validated classification accuracy.
-        """
-        fixed = dict(fixed or {})
-        # Handle search_space: if None, use empty dict (will get defaults)
-        # If provided as empty dict {}, respect that (no defaults)
-        if search_space is None:
-            search_space = {}
-        else:
-            search_space = dict(search_space)
-
-        # Default search space if not provided and not in fixed
-        # Only add defaults if the parameter is not explicitly in fixed
-        if "max_depth" not in search_space and "max_depth" not in fixed:
-            search_space["max_depth"] = {"low": 2, "high": 15}
-        if "min_samples_split" not in search_space and "min_samples_split" not in fixed:
-            search_space["min_samples_split"] = {"low": 2, "high": 20}
-        if "min_samples_leaf" not in search_space and "min_samples_leaf" not in fixed:
-            search_space["min_samples_leaf"] = {"low": 1, "high": 10}
-
-        # Debug: print what will be tuned
-        if len(search_space) == 0:
-            raise ValueError(
-                "No parameters to tune! Search space is empty. "
-                "Either provide a search_space or ensure parameters are not all in 'fixed'."
-            )
-
-        def objective(trial):
-            params = dict(fixed)
-
-            # Suggest hyperparameters from search space
-            for name, spec in search_space.items():
-                if name in fixed:
-                    continue  # Skip if already in fixed params
-
-                if spec.get("log", False):
-                    params[name] = trial.suggest_int(
-                        name, spec["low"], spec["high"], log=True
-                    )
-                else:
-                    step = spec.get("step", 1)
-                    params[name] = trial.suggest_int(
-                        name, spec["low"], spec["high"], step=step
-                    )
-
-            # Add random_state if provided
-            if random_state is not None:
-                params["random_state"] = random_state
-
-            accuracy = self._region_type_cv_accuracy(
-                X, region_types, params, n_splits=n_splits, random_state=random_state
-            )
-            return accuracy if np.isfinite(accuracy) else 0.0
-
-        sampler = optuna.samplers.TPESampler(seed=random_state)
-        study = optuna.create_study(direction="maximize", sampler=sampler)
-        # Note: Optuna TPE sampler doesn't support parallelization natively
-        # For parallel Optuna trials, consider using optuna.study.Study.optimize with n_jobs
-        # However, TPE requires sequential trials, so we keep show_progress_bar=False
-        study.optimize(objective, n_trials=n_trials, show_progress_bar=False)
-
-        if len(study.trials) == 0 or study.best_trial is None:
-            raise RuntimeError(
-                "No successful trials completed for classification tree optimization."
-            )
-
-        best_params = dict(fixed)
-        best_params.update(study.best_trial.params)
-        if random_state is not None:
-            best_params["random_state"] = random_state
-
-        return best_params, study.best_value

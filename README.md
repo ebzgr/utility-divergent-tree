@@ -4,6 +4,18 @@ Python package for identifying heterogeneous treatment effects on two outcomes (
 
 ## Installation
 
+1. Create and activate a virtual environment:
+
+```bash
+python -m venv .venv
+# On Windows:
+.venv\Scripts\activate
+# On Linux/Mac:
+source .venv/bin/activate
+```
+
+2. Install dependencies and package:
+
 ```bash
 pip install -r requirements.txt
 pip install -e .
