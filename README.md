@@ -2,26 +2,51 @@
 
 Python package for identifying heterogeneous treatment effects on two outcomes (firm and consumer) using recursive partitioning.
 
+**Requirements**: Python >= 3.9
+
 ## Installation
 
-1. Create and activate a virtual environment:
+1. Download the package:
+
+```bash
+git clone https://github.com/ebzgr/divergence-tree  # Replace with actual repository URL
+cd divergence-tree
+```
+
+2. Create a virtual environment:
+
+**Windows:**
 
 ```bash
 python -m venv .venv
-# On Windows:
 .venv\Scripts\activate
-# On Linux/Mac:
+```
+
+**Linux/Mac:**
+
+```bash
+python -m venv .venv
 source .venv/bin/activate
 ```
 
-2. Install dependencies and package:
+3. Install dependencies and package:
 
 ```bash
-pip install -r requirements.txt
-pip install -e .
+pip install -r requirements.txt  # Installs dependencies with specific versions
+pip install -e .                 # Installs the package in editable mode
 ```
 
 **Dependencies**: numpy, pandas, matplotlib, optuna, scikit-learn, econml
+
+## Quick Start
+
+```python
+from divtree.tree import DivergenceTree
+
+tree = DivergenceTree(max_partitions=8, min_improvement_ratio=0.01)
+tree.fit(X, T, YF, YC)
+region_types = tree.predict_region_type(X)  # Returns array of 1-4
+```
 
 ## Methods
 
@@ -39,6 +64,13 @@ Recursive partitioning algorithm that directly segments populations based on joi
 ```
 g(τF, τC) = (τF - τ̄F)²/σF² + (τC - τ̄C)²/σC² + λ·φ((τF - τ̄F)(τC - τ̄C)/(σF·σC))
 ```
+
+**Region types** (same for both methods):
+
+- Region 1: τF > 0, τC > 0 (both positive)
+- Region 2: τF > 0, τC ≤ 0 (firm positive, consumer negative)
+- Region 3: τF ≤ 0, τC > 0 (firm negative, consumer positive)
+- Region 4: τF ≤ 0, τC ≤ 0 (both negative)
 
 **Key parameters**:
 
@@ -81,15 +113,8 @@ Two-step approach: causal forests estimate treatment effects, then a classificat
 
 1. Fit separate causal forests for YF and YC using `econml.dml.CausalForestDML`
 2. Estimate τF and τC for all observations
-3. Categorize into 4 region types based on effect signs
+3. Categorize into 4 region types based on effect signs (see region types above)
 4. Train `sklearn.tree.DecisionTreeClassifier` to predict region types
-
-**Region types**:
-
-- Region 1: τF > 0, τC > 0
-- Region 2: τF > 0, τC ≤ 0
-- Region 3: τF ≤ 0, τC > 0
-- Region 4: τF ≤ 0, τC ≤ 0
 
 **Usage**:
 
@@ -114,6 +139,11 @@ tree.fit(
 
 region_types = tree.predict_region_type(X)
 ```
+
+## When to Use Which Method
+
+- **DivergenceTree**: Direct optimization of joint treatment effects. Better when you want a single unified model and have sufficient data for tuning.
+- **TwoStepDivergenceTree**: Separates effect estimation from classification. Better when you need interpretable treatment effect estimates or want to leverage causal forest's robustness.
 
 ## Examples
 
