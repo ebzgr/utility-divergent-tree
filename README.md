@@ -2,7 +2,7 @@
 
 Python package for identifying heterogeneous treatment effects on two outcomes using recursive partitioning to understand relationships and trade-offs.
 
-**Requirements**: Python >= 3.9
+**Requirements**: Python >= 3.9, < 3.13 (Python 3.10+ recommended for NumPy 2.x support)
 
 ## What is Divergence Tree?
 
@@ -71,7 +71,45 @@ source .venv/bin/activate
 pip install -e .
 ```
 
-**Dependencies**: numpy, pandas, matplotlib, optuna, scikit-learn, econml
+**If you encounter installation issues**, try:
+
+```bash
+# Option 1: Upgrade pip first
+pip install --upgrade pip setuptools wheel
+
+# Option 2: Install with exact versions (if flexible versions fail)
+pip install -r requirements-exact.txt
+pip install -e .
+
+# Option 3: Install dependencies separately
+pip install -r requirements.txt
+pip install -e .
+```
+
+**Dependencies**: numpy, pandas, matplotlib, optuna, scikit-learn, econml, scipy, joblib, lightgbm, shap, sparse, statsmodels
+
+### Troubleshooting Installation
+
+**Common issues:**
+
+1. **"No module named 'econml'" or missing dependencies**:
+
+   - Ensure all dependencies are installed: `pip install -r requirements.txt`
+   - Some systems may need to install build tools (e.g., `build-essential` on Linux)
+
+2. **NumPy compatibility errors**:
+
+   - If using Python < 3.10, you may need numpy < 2.0: `pip install "numpy<2.0"`
+   - NumPy 2.x requires Python 3.10+
+
+3. **LightGBM installation fails**:
+
+   - Windows: May need Visual C++ Build Tools
+   - Linux/Mac: May need `cmake` and `g++`
+
+4. **Version conflicts**:
+   - Use `requirements-exact.txt` for exact version matching
+   - Or create a fresh virtual environment: `python -m venv .venv --clear`
 
 ## Usage
 
